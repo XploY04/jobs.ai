@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+import os
 
 from src.api.routes import router
 from src.database.operations import db
@@ -25,11 +26,14 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     async def startup_event() -> None:
         await db.connect()
-        scheduler.start()
+        # Skip scheduler in test mode to avoid event loop issues
+        if not os.getenv('DISABLE_SCHEDULER'):
+            scheduler.start()
 
     @app.on_event("shutdown")
     async def shutdown_event() -> None:
-        scheduler.stop()
+        if not os.getenv('DISABLE_SCHEDULER'):
+            scheduler.stop()
         await db.disconnect()
 
     app.include_router(router)

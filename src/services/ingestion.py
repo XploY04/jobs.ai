@@ -12,12 +12,16 @@ from src.agents.adzuna import AdzunaFetcher
 from src.agents.jsearch import JSearchFetcher
 from src.agents.remoteok import RemoteOKFetcher
 from src.database.operations import db
+from src.enrichment.enrichment_pipeline import EnrichmentPipeline
 from src.utils.config import settings
 from src.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
 FETCHER_CLASSES = [RemoteOKFetcher, JSearchFetcher, AdzunaFetcher]
+
+# Initialize enrichment pipeline
+enrichment_pipeline = EnrichmentPipeline(use_ai=settings.enable_ai_enrichment)
 
 
 async def run_ingestion_cycle() -> Dict[str, Any]:
@@ -32,6 +36,16 @@ async def run_ingestion_cycle() -> Dict[str, Any]:
     for source_name, jobs in results:
         per_source[source_name] = len(jobs)
         all_jobs.extend(jobs)
+
+    # Enrich jobs before saving to database
+    if all_jobs and settings.enable_ai_enrichment:
+        logger.info(f"Enriching {len(all_jobs)} jobs...")
+        try:
+            all_jobs = enrichment_pipeline.enrich_batch(all_jobs)
+            logger.info("Enrichment complete")
+        except Exception as e:
+            logger.error(f"Enrichment failed: {e}")
+            # Continue with unenriched jobs
 
     db_stats = await db.save_jobs(all_jobs) if all_jobs else {"new": 0, "skipped": 0}
 

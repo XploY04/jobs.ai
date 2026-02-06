@@ -1,0 +1,27 @@
+# Core
+python-dotenv==1.0.0
+pydantic==2.5.0
+pydantic-settings==2.1.0
+
+# Database
+asyncpg==0.29.0
+sqlalchemy==2.0.23
+
+# API
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+
+# HTTP
+aiohttp==3.9.1
+httpx==0.25.2
+
+# Utilities
+python-dateutil==2.8.2
+pyyaml==6.0.1
+
+# Scheduling
+apscheduler==3.10.4
+
+# Testing
+pytest==7.4.3
+pytest-asyncio==0.21.1

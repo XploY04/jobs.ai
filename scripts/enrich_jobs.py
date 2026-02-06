@@ -85,7 +85,7 @@ async def enrich_existing_jobs(
                 'company': job.company,
                 'description': job.description,
                 'location': job.location,
-                'employment_type': job.employment_type.value if job.employment_type else None,
+                'employment_type': job.employment_type if isinstance(job.employment_type, str) else (job.employment_type.value if job.employment_type else None),
                 'salary_min': job.salary_min,
                 'salary_max': job.salary_max,
                 'apply_url': job.apply_url,

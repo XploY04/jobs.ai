@@ -16,7 +16,7 @@ class AIProcessor:
         """Initialize Gemini AI"""
         if settings.gemini_api_key:
             genai.configure(api_key=settings.gemini_api_key)
-            self.model = genai.GenerativeModel('gemini-pro')
+            self.model = genai.GenerativeModel('gemini-2.5-flash')
             self.enabled = True
             logger.info("Gemini AI processor initialized")
         else:
@@ -42,13 +42,24 @@ class AIProcessor:
             prompt = self._build_enrichment_prompt(job)
             response = self.model.generate_content(prompt)
             
+            # Log the raw response for debugging
+            response_text = response.text.strip()
+            logger.debug(f"Raw AI response: {response_text[:200]}")
+            
+            # Try to extract JSON from markdown code blocks if present
+            if "```json" in response_text:
+                response_text = response_text.split("```json")[1].split("```")[0].strip()
+            elif "```" in response_text:
+                response_text = response_text.split("```")[1].split("```")[0].strip()
+            
             # Parse JSON response
-            result = json.loads(response.text)
+            result = json.loads(response_text)
             logger.info(f"AI enriched job {job.get('id', 'unknown')}")
             return result
             
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse AI response: {e}")
+            logger.error(f"Response was: {response_text if 'response_text' in locals() else 'N/A'}")
             return {}
         except Exception as e:
             logger.error(f"AI enrichment failed: {e}")

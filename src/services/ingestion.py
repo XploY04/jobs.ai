@@ -11,6 +11,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from src.agents.adzuna import AdzunaFetcher
 from src.agents.jsearch import JSearchFetcher
 from src.agents.remoteok import RemoteOKFetcher
+from src.agents.hackernews import HackerNewsFetcher
+from src.agents.rss_feed import RSSFeedFetcher
 from src.database.operations import db
 from src.enrichment.enrichment_pipeline import EnrichmentPipeline
 from src.utils.config import settings
@@ -18,7 +20,7 @@ from src.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
-FETCHER_CLASSES = [RemoteOKFetcher, JSearchFetcher, AdzunaFetcher]
+FETCHER_CLASSES = [RemoteOKFetcher, JSearchFetcher, AdzunaFetcher, HackerNewsFetcher, RSSFeedFetcher]
 
 # Initialize enrichment pipeline
 enrichment_pipeline = EnrichmentPipeline(use_ai=settings.enable_ai_enrichment)
@@ -62,7 +64,7 @@ async def run_ingestion_cycle() -> Dict[str, Any]:
     return summary
 
 
-async def _collect_jobs(fetcher: RemoteOKFetcher | JSearchFetcher | AdzunaFetcher) -> Tuple[str, List[Dict[str, Any]]]:
+async def _collect_jobs(fetcher) -> Tuple[str, List[Dict[str, Any]]]:
     try:
         jobs = await fetcher.fetch_jobs()
         return fetcher.source_name, jobs

@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     adzuna_app_id: Optional[str] = None
     adzuna_api_key: Optional[str] = None
     gemini_api_key: Optional[str] = None
+    serpapi_key: Optional[str] = None
 
     # AI Enrichment
     enable_ai_enrichment: bool = True

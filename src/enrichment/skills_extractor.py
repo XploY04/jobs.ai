@@ -107,6 +107,33 @@ class SkillsExtractor:
         """Categorize the role based on skills and job details"""
         
         text = f"{title} {description}".lower()
+        title_lower = title.lower()
+        
+        # First, check if this is a non-technical role (sales, marketing, HR, etc.)
+        # These should NOT be categorized as backend/frontend/devops even if tech is mentioned
+        non_technical_keywords = [
+            'sales', 'account executive', 'account manager', 'business development',
+            'marketing', 'recruiter', 'recruiting', 'hr ', 'human resources',
+            'operations', 'finance', 'legal', 'compliance', 'customer success',
+            'support', 'content', 'copywriter', 
+            'product manager', 'product owner', 'project manager', 'program manager',
+            'analyst', 'business analyst', 'data analyst'  # Note: data analyst is different from data engineer
+        ]
+        
+        # Check title first (most important signal) - but exclude engineering managers
+        # Engineering Manager is technical, but Sales Manager is not
+        is_engineering_manager = 'engineering manager' in title_lower or 'eng manager' in title_lower
+        
+        if not is_engineering_manager:
+            for keyword in non_technical_keywords:
+                if keyword in title_lower:
+                    return 'general'
+        
+        # Special handling for design roles
+        if any(keyword in title_lower for keyword in ['designer', 'ux', 'ui', 'design lead']):
+            # Only UX/UI designers without "engineer" should be general
+            if 'engineer' not in title_lower and 'developer' not in title_lower:
+                return 'general'
         
         # Frontend indicators
         frontend_score = sum([

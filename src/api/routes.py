@@ -24,9 +24,21 @@ async def list_jobs(
     source: Optional[List[str]] = Query(default=None, alias="source"),
     employment_type: Optional[str] = Query(default=None),
     remote_only: bool = Query(default=False),
+    seniority: Optional[List[str]] = Query(default=None, alias="seniority"),
+    category: Optional[List[str]] = Query(default=None, alias="category"),
 ) -> JobsListResponse:
     """Return paginated backend/devops jobs."""
 
+    # Get total count and paginated jobs
+    total = await db.count_jobs(
+        search=search,
+        sources=source,
+        employment_type=employment_type,
+        remote_only=remote_only,
+        seniority=seniority,
+        category=category,
+    )
+    
     jobs = await db.list_jobs(
         limit=limit,
         offset=offset,
@@ -34,9 +46,11 @@ async def list_jobs(
         sources=source,
         employment_type=employment_type,
         remote_only=remote_only,
+        seniority=seniority,
+        category=category,
     )
 
-    return JobsListResponse(total=len(jobs), jobs=jobs)
+    return JobsListResponse(total=total, jobs=jobs)
 
 
 @router.get("/jobs/{job_id}", response_model=JobResponse)
@@ -47,6 +61,13 @@ async def get_job(job_id: str) -> JobResponse:
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
+
+
+@router.get("/filters")
+async def get_filters() -> dict:
+    """Return available filter options with job counts."""
+    
+    return await db.get_filter_options()
 
 
 @router.post("/jobs/ingest")

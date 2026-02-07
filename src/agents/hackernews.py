@@ -1,5 +1,6 @@
 """HackerNews 'Who is Hiring?' scraper"""
 
+import asyncio
 import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -17,23 +18,19 @@ class HackerNewsFetcher(BaseFetcher):
     Fetcher for HackerNews 'Who is Hiring?' monthly threads.
     
     HN posts a monthly thread where companies post job listings in comments.
-    Format is typically:
-    - Company name (often in header or first line)
-    - Location (REMOTE, ONSITE: City, HYBRID)
-    - Job title
-    - Description
-    - Apply URL or email
+    Returns ALL job comments as raw data — no filtering.
     """
 
     HN_API_BASE = "https://hacker-news.firebaseio.com/v0"
     ALGOLIA_API = "https://hn.algolia.com/api/v1"
+    MAX_COMMENTS = 1000  # Fetch more comments from the thread
 
     def __init__(self) -> None:
         super().__init__("hackernews")
 
     async def fetch_jobs(self) -> List[Dict[str, Any]]:
-        """Fetch jobs from latest 'Who is Hiring?' thread"""
-        logger.info("[%s] Fetching jobs from HackerNews", self.source_name)
+        """Fetch ALL jobs from latest 'Who is Hiring?' thread — no filtering"""
+        logger.info("[%s] Fetching ALL jobs from HackerNews (no filtering)", self.source_name)
 
         async with aiohttp.ClientSession() as session:
             # Find the latest "Who is Hiring?" thread
@@ -46,14 +43,14 @@ class HackerNewsFetcher(BaseFetcher):
             comments = await self._fetch_thread_comments(session, thread_id)
             logger.info("[%s] Found %d comments in thread", self.source_name, len(comments))
 
-            # Parse job postings from comments
+            # Parse ALL job postings from comments — no backend filter
             jobs = []
             for comment in comments:
                 job = self._parse_comment_to_job(comment)
-                if job and self.is_backend_devops_job(job["title"], job["description"]):
+                if job:
                     jobs.append(job)
 
-        logger.info("[%s] Extracted %d backend/devops jobs", self.source_name, len(jobs))
+        logger.info("[%s] Extracted %d total jobs (ALL - no filtering)", self.source_name, len(jobs))
         return jobs
 
     async def _find_latest_thread(self, session: aiohttp.ClientSession) -> Optional[int]:
@@ -104,7 +101,7 @@ class HackerNewsFetcher(BaseFetcher):
                     return []
 
                 thread_data = await response.json()
-                comment_ids = thread_data.get("kids", [])[:500]  # Limit to first 500 comments
+                comment_ids = thread_data.get("kids", [])[:1000]  # Fetch up to 1000 comments
 
                 # Fetch all comments in parallel
                 tasks = [self._fetch_comment(session, cid) for cid in comment_ids]
@@ -130,63 +127,61 @@ class HackerNewsFetcher(BaseFetcher):
 
     def _parse_comment_to_job(self, comment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
-        Parse a HN comment into a job posting.
-        
-        HN format is freeform but typically:
-        CompanyName | Job Title | Location | REMOTE/ONSITE
-        Description...
-        Apply: URL or email
+        Parse a HN comment into a raw job posting.
+        Returns ALL data — no filtering, no normalization.
         """
         text = comment.get("text", "")
         if not text or len(text) < 50:  # Too short to be a real job posting
             return None
 
         # Remove HTML tags
-        text = re.sub(r"<[^>]+>", " ", text)
-        text = re.sub(r"\s+", " ", text).strip()
+        clean_text = re.sub(r"<[^>]+>", " ", text)
+        clean_text = re.sub(r"\s+", " ", clean_text).strip()
 
-        # Skip if it looks like a comment, not a job posting
-        if any(phrase in text.lower() for phrase in ["looking for", "seeking employment", "available for hire", "open to opportunities"]):
+        # Skip if it looks like a job-seeker comment, not a job posting
+        if any(phrase in clean_text.lower() for phrase in ["looking for", "seeking employment", "available for hire", "open to opportunities"]):
             return None
 
         # Extract components
-        lines = [line.strip() for line in text.split("\n") if line.strip()]
+        lines = [line.strip() for line in clean_text.split("\n") if line.strip()]
         if not lines:
             return None
 
         # First line often has: Company | Title | Location
         first_line = lines[0]
         company = self._extract_company(first_line)
-        title = self._extract_title(first_line, text)
-        location = self._extract_location(text)
-        remote = self._is_remote(text)
+        title = self._extract_title(first_line, clean_text)
+        location = self._extract_location(clean_text)
+        remote = self._is_remote(clean_text)
 
-        # Get description (everything except URLs and email)
-        description = self._clean_description(text)
+        # Get description (everything)
+        description = self._clean_description(clean_text)
 
         # Extract apply URL or email
-        apply_url = self._extract_apply_url(text)
+        apply_url = self._extract_apply_url(text)  # Use original HTML text for URLs
 
-        # Must have at least title
-        if not title:
+        # Must have at least some content
+        if not title and not description:
             return None
 
+        # Return raw data with ALL extracted info + original comment data
         return {
-            "source": self.source_name,
-            "source_id": str(comment.get('id', 0)),
-            "title": title[:200],
-            "company": company[:100] if company else "See Description",
-            "description": description[:5000],
-            "location": {
-                "city": None,
-                "country": None,
-                "remote": remote,
-            },
-            "employment_type": "full-time",
-            "salary_min": None,
-            "salary_max": None,
-            "apply_url": apply_url or f"https://news.ycombinator.com/item?id={comment.get('id')}",
-            "posted_at": datetime.fromtimestamp(comment.get("time", 0), tz=timezone.utc) if comment.get("time") else datetime.now(timezone.utc),
+            '_source': self.source_name,
+            '_raw_html': text,  # Original HTML content
+            '_raw_text': clean_text,  # Cleaned text
+            '_first_line': first_line,
+            'id': str(comment.get('id', 0)),
+            'title': title[:200] if title else first_line[:200],
+            'company': company[:100] if company else "See Description",
+            'description': description[:8000],
+            'location_raw': location,
+            'remote': remote,
+            'apply_url': apply_url or f"https://news.ycombinator.com/item?id={comment.get('id')}",
+            'hn_comment_id': comment.get('id'),
+            'hn_parent_id': comment.get('parent'),
+            'hn_author': comment.get('by', ''),
+            'hn_time': comment.get('time'),
+            'posted_at': datetime.fromtimestamp(comment.get("time", 0), tz=timezone.utc) if comment.get("time") else datetime.now(timezone.utc),
         }
 
     def _extract_company(self, first_line: str) -> Optional[str]:

@@ -1,9 +1,7 @@
 import asyncio
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import aiohttp
-from dateutil import parser
 
 from src.agents import BaseFetcher
 from src.utils.config import settings
@@ -16,16 +14,50 @@ class JSearchFetcher(BaseFetcher):
     """Fetcher for JSearch via RapidAPI."""
 
     BASE_URL = "https://jsearch.p.rapidapi.com/search"
-    BACKEND_DEVOPS_QUERIES = [
+    
+    # Broad IT/tech queries to capture ALL tech jobs
+    QUERIES = [
+        "software engineer",
+        "software developer",
         "backend engineer",
         "backend developer",
+        "frontend engineer",
+        "frontend developer",
+        "full stack developer",
         "devops engineer",
         "site reliability engineer",
         "cloud engineer",
         "platform engineer",
+        "data engineer",
+        "data scientist",
+        "machine learning engineer",
+        "AI engineer",
+        "mobile developer",
+        "iOS developer",
+        "android developer",
+        "QA engineer",
+        "test engineer",
+        "security engineer",
+        "cybersecurity",
+        "network engineer",
+        "systems engineer",
+        "database administrator",
+        "solutions architect",
+        "cloud architect",
+        "technical lead",
+        "engineering manager",
+        "product engineer",
+        "embedded engineer",
+        "firmware engineer",
         "golang developer",
-        "python backend",
+        "python developer",
+        "java developer",
+        "rust developer",
+        "react developer",
+        "node.js developer",
     ]
+    
+    MAX_PAGES = 5  # Pages per query
 
     def __init__(self) -> None:
         super().__init__("jsearch")
@@ -37,73 +69,62 @@ class JSearchFetcher(BaseFetcher):
         if not self.api_key:
             return []
 
-        logger.info("[%s] Fetching jobs", self.source_name)
+        logger.info("[%s] Fetching ALL IT/tech jobs (%d queries, %d pages each)", 
+                     self.source_name, len(self.QUERIES), self.MAX_PAGES)
         results: List[Dict[str, Any]] = []
 
         async with aiohttp.ClientSession() as session:
-            for query in self.BACKEND_DEVOPS_QUERIES:
+            for query in self.QUERIES:
                 query_jobs = await self._fetch_query(session, query)
                 results.extend(query_jobs)
                 await asyncio.sleep(1)  # stay within rate limits
 
-        logger.info("[%s] Found %d jobs", self.source_name, len(results))
+        logger.info("[%s] Fetched %d total raw jobs (ALL - no filtering)", self.source_name, len(results))
         return results
 
     async def _fetch_query(self, session: aiohttp.ClientSession, query: str) -> List[Dict[str, Any]]:
-        params = {
-            "query": query,
-            "page": "1",
-            "num_pages": "1",
-            "date_posted": "month",
-        }
-        headers = {
-            "X-RapidAPI-Key": self.api_key,
-            "X-RapidAPI-Host": "jsearch.p.rapidapi.com",
-        }
-
-        try:
-            async with session.get(self.BASE_URL, params=params, headers=headers, timeout=30) as response:
-                if response.status != 200:
-                    logger.error("[%s] HTTP %s for query '%s'", self.source_name, response.status, query)
-                    return []
-
-                payload = await response.json()
-        except Exception as exc:  # pylint: disable=broad-except
-            logger.error("[%s] Request error for query '%s': %s", self.source_name, query, exc, exc_info=True)
-            return []
-
-        normalized = []
-        for job in payload.get("data", []):
-            normalized_job = self._normalize(job)
-            if normalized_job and self.is_backend_devops_job(normalized_job["title"], normalized_job["description"]):
-                normalized.append(normalized_job)
-
-        return normalized
-
-    def _normalize(self, job: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        try:
-            posted_str = job.get("job_posted_at_datetime_utc")
-            posted_at = parser.isoparse(posted_str) if posted_str else datetime.now(timezone.utc)
-
-            return {
-                "source": self.source_name,
-                "source_id": job.get("job_id", ""),
-                "title": job.get("job_title", ""),
-                "company": job.get("employer_name", ""),
-                "description": job.get("job_description", ""),
-                "location": {
-                    "city": job.get("job_city"),
-                    "country": job.get("job_country"),
-                    "remote": job.get("job_is_remote", False),
-                },
-                "employment_type": (job.get("job_employment_type") or "FULLTIME").upper(),
-                "salary_min": job.get("job_min_salary"),
-                "salary_max": job.get("job_max_salary"),
-                "salary_currency": job.get("job_salary_currency"),
-                "apply_url": job.get("job_apply_link", ""),
-                "posted_at": posted_at,
-                "raw_data": job,
+        all_jobs: List[Dict[str, Any]] = []
+        
+        for page in range(1, self.MAX_PAGES + 1):
+            params = {
+                "query": query,
+                "page": str(page),
+                "num_pages": "1",
+                "date_posted": "month",
             }
-        except Exception as exc:  # pylint: disable=broad-except
-            logger.error("[%s] Normalization error: %s", self.source_name, exc, exc_info=True)
-            return None
+            headers = {
+                "X-RapidAPI-Key": self.api_key,
+                "X-RapidAPI-Host": "jsearch.p.rapidapi.com",
+            }
+
+            try:
+                async with session.get(self.BASE_URL, params=params, headers=headers, timeout=30) as response:
+                    if response.status == 429:
+                        logger.warning("[%s] Rate limited on query '%s' page %d, stopping query", 
+                                      self.source_name, query, page)
+                        break
+                    if response.status != 200:
+                        logger.error("[%s] HTTP %s for query '%s' page %d", 
+                                    self.source_name, response.status, query, page)
+                        break
+
+                    payload = await response.json()
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.error("[%s] Request error for query '%s' page %d: %s", 
+                            self.source_name, query, page, exc, exc_info=True)
+                break
+
+            data = payload.get("data", [])
+            if not data:
+                break
+            
+            # Return raw data with query context
+            for job in data:
+                job['_jsearch_query'] = query
+                job['_jsearch_page'] = page
+                all_jobs.append(job)
+            
+            logger.debug("[%s] Fetched %d jobs for '%s' page %d", self.source_name, len(data), query, page)
+            await asyncio.sleep(0.5)  # Delay between pages
+
+        return all_jobs

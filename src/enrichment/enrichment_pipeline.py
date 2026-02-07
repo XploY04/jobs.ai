@@ -1,10 +1,19 @@
-"""Complete enrichment pipeline combining rule-based and AI approaches"""
+"""Job processing pipeline: Raw API data → Gemini AI → Structured schema.
 
-from typing import Dict, Any, List
+NO normalizer. Gemini sees the full raw data and extracts everything.
+For jobs where AI is disabled or fails, a lightweight fallback extractor runs.
+"""
+
+import asyncio
+import hashlib
+import json
+import re
+from datetime import datetime, timezone
+from typing import Dict, Any, List, Optional
+
+from src.enrichment.ai_processor import AIProcessor
 from src.enrichment.skills_extractor import SkillsExtractor
 from src.enrichment.quality_scorer import QualityScorer
-from src.enrichment.urgency_detector import UrgencyDetector
-from src.enrichment.ai_processor import AIProcessor
 from src.utils.logger import setup_logger
 from src.utils.config import settings
 
@@ -13,156 +22,397 @@ logger = setup_logger(__name__)
 
 class EnrichmentPipeline:
     """
-    Complete job enrichment pipeline
+    The single transformation layer for all job data.
     
-    Phase A: Rule-based (fast, free)
-    - Extract tech skills
-    - Calculate quality score
-    - Detect urgency
-    - Basic categorization
+    Flow: Raw API data → AI extraction → structured job dict → DB
     
-    Phase B: AI-powered (optional, uses Gemini)
-    - Advanced skill extraction
-    - Seniority detection
-    - Work arrangement parsing
-    - Visa sponsorship detection
+    When AI is enabled:  Raw → Gemini (extracts all 40 fields) → quality score → done
+    When AI is disabled: Raw → fallback extractor (basic field mapping) → done
     """
 
     def __init__(self, use_ai: bool = None):
-        """
-        Initialize enrichment pipeline
-        
-        Args:
-            use_ai: Enable AI enrichment (uses Gemini API). 
-                   If None, uses ENABLE_AI_ENRICHMENT from config
-        """
-        self.skills_extractor = SkillsExtractor()
-        self.quality_scorer = QualityScorer()
-        self.urgency_detector = UrgencyDetector()
-        
-        # AI processor (optional)
         self.use_ai = use_ai if use_ai is not None else settings.enable_ai_enrichment
         self.ai_processor = AIProcessor() if self.use_ai else None
+        self.skills_extractor = SkillsExtractor()
+        self.quality_scorer = QualityScorer()
         
-        logger.info(f"Enrichment pipeline initialized (AI: {'enabled' if self.use_ai else 'disabled'})")
+        logger.info(f"Pipeline initialized (AI: {'enabled' if self.use_ai else 'disabled'})")
 
-    def enrich(self, job: Dict[str, Any]) -> Dict[str, Any]:
+    # ------------------------------------------------------------------
+    # Main entry point: process raw jobs from a source
+    # ------------------------------------------------------------------
+
+    async def process_source(self, source_name: str, raw_jobs: List[Dict[str, Any]],
+                             max_concurrent: int = 20) -> List[Dict[str, Any]]:
         """
-        Enrich a single job with all available insights
+        Process ALL raw jobs from a single source into final structured format.
         
-        Returns enriched job data with additional fields:
-        - skills: List[str]
-        - ai_category: str
-        - ai_quality_score: int
-        - ai_urgency: str
-        - ai_extracted_deadline: datetime (optional)
-        - ai_deadline_confidence: str
-        - Plus AI-powered fields if enabled
+        This replaces both normalize_raw_jobs() and enrich_batch_async().
+        Raw data goes in, fully structured jobs come out.
         """
-        
-        enriched = job.copy()
-        
-        # Phase A: Rule-based enrichment (always runs)
-        title = job.get('title', '')
-        description = job.get('description', '')
-        
-        # Extract skills
-        skills = self.skills_extractor.extract(title, description)
-        enriched['skills'] = skills
-        
-        # Categorize role
-        category = self.skills_extractor.categorize_role(title, description, skills)
-        enriched['ai_category'] = category
-        
-        # Calculate quality score
-        quality_score = self.quality_scorer.score(job)
-        enriched['ai_quality_score'] = quality_score
-        
-        # Detect urgency
-        urgency = self.urgency_detector.detect_urgency(title, description)
-        enriched['ai_urgency'] = urgency
-        
-        # Extract deadline
-        deadline, confidence = self.urgency_detector.extract_deadline(description)
-        if deadline:
-            enriched['ai_extracted_deadline'] = deadline
-            enriched['ai_deadline_confidence'] = confidence
-        
-        # Phase B: AI enrichment (optional)
+        if not raw_jobs:
+            return []
+
+        logger.info(f"[{source_name}] Processing {len(raw_jobs)} raw jobs...")
+
         if self.use_ai and self.ai_processor and self.ai_processor.enabled:
-            try:
-                ai_insights = self.ai_processor.enrich_job(job)
-                
-                if ai_insights:
-                    # Merge AI insights (prefixed with ai_)
-                    for key, value in ai_insights.items():
-                        enriched[f'ai_{key}'] = value
-                    
-                    # Override category with AI if available
-                    if ai_insights.get('seniority_level'):
-                        enriched['ai_seniority'] = ai_insights['seniority_level']
-                        
-            except Exception as e:
-                logger.error(f"AI enrichment failed for job {job.get('id')}: {e}")
-        
-        return enriched
+            jobs = await self._process_with_ai(source_name, raw_jobs, max_concurrent)
+        else:
+            jobs = self._process_with_fallback(source_name, raw_jobs)
 
-    def enrich_batch(self, jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Enrich multiple jobs efficiently
-        
-        For rule-based: Processes each job
-        For AI: Can batch process for efficiency
-        """
-        
-        enriched_jobs = []
-        
-        logger.info(f"Enriching {len(jobs)} jobs...")
-        
-        for i, job in enumerate(jobs):
-            try:
-                enriched = self.enrich(job)
-                enriched_jobs.append(enriched)
-                
-                if (i + 1) % 10 == 0:
-                    logger.info(f"Enriched {i + 1}/{len(jobs)} jobs")
-                    
-            except Exception as e:
-                logger.error(f"Failed to enrich job {job.get('id', 'unknown')}: {e}")
-                enriched_jobs.append(job)  # Add original if enrichment fails
-        
-        logger.info(f"Enrichment complete: {len(enriched_jobs)}/{len(jobs)} successful")
-        
-        return enriched_jobs
+        logger.info(f"[{source_name}] Processed: {len(jobs)}/{len(raw_jobs)} jobs")
+        return jobs
 
-    def get_enrichment_stats(self, jobs: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Get statistics about enrichment quality"""
+    # ------------------------------------------------------------------
+    # AI-powered processing (primary path)
+    # ------------------------------------------------------------------
+
+    async def _process_with_ai(self, source: str, raw_jobs: List[Dict[str, Any]],
+                                max_concurrent: int) -> List[Dict[str, Any]]:
+        """Send raw jobs to Gemini for structured extraction."""
+        semaphore = asyncio.Semaphore(max_concurrent)
+        completed = 0
+        total = len(raw_jobs)
+
+        async def process_one(raw_job: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            nonlocal completed
+            async with semaphore:
+                try:
+                    loop = asyncio.get_event_loop()
+                    ai_result = await loop.run_in_executor(
+                        None, self.ai_processor.process_raw_job, source, raw_job
+                    )
+
+                    if ai_result:
+                        job = self._finalize_job(source, raw_job, ai_result)
+                        completed += 1
+                        if completed % 25 == 0:
+                            logger.info(f"[{source}] AI processed {completed}/{total}")
+                        return job
+                    else:
+                        # AI failed for this job — use fallback
+                        return self._fallback_extract(source, raw_job)
+                except Exception as e:
+                    logger.error(f"[{source}] AI processing error: {e}")
+                    return self._fallback_extract(source, raw_job)
+
+        tasks = [process_one(job) for job in raw_jobs]
+        results = await asyncio.gather(*tasks)
+        return [r for r in results if r is not None]
+
+    # ------------------------------------------------------------------
+    # Fallback processing (no AI)
+    # ------------------------------------------------------------------
+
+    def _process_with_fallback(self, source: str, raw_jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Process jobs using rule-based extraction when AI is disabled."""
+        jobs = []
+        for raw_job in raw_jobs:
+            job = self._fallback_extract(source, raw_job)
+            if job:
+                jobs.append(job)
+        return jobs
+
+    def _fallback_extract(self, source: str, raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Lightweight field extraction for when AI is unavailable.
+        Pulls fields from known locations in each source's raw data.
+        """
+        try:
+            extracted = {}
+
+            if source == "remoteok":
+                extracted = {
+                    "title": raw.get("position") or raw.get("title", ""),
+                    "company": raw.get("company", "Unknown"),
+                    "company_logo": raw.get("company_logo") or raw.get("logo"),
+                    "description": raw.get("description", ""),
+                    "is_remote": True,
+                    "work_arrangement": "remote",
+                    "country": raw.get("location"),
+                    "employment_type": (raw.get("type") or "FULLTIME").upper(),
+                    "salary_min": self._to_str(raw.get("salary_min")),
+                    "salary_max": self._to_str(raw.get("salary_max")),
+                    "salary_currency": raw.get("salary_currency", "USD"),
+                    "apply_url": raw.get("url", ""),
+                    "posted_at": self._parse_epoch(raw.get("epoch")),
+                    "tags": raw.get("tags", []),
+                    "skills": raw.get("tags", []),
+                }
+
+            elif source == "jsearch":
+                loc_city = raw.get("job_city")
+                loc_country = raw.get("job_country")
+                extracted = {
+                    "title": raw.get("job_title", ""),
+                    "company": raw.get("employer_name", "Unknown"),
+                    "company_logo": raw.get("employer_logo"),
+                    "company_website": raw.get("employer_website"),
+                    "description": raw.get("job_description", ""),
+                    "city": loc_city,
+                    "country": loc_country,
+                    "is_remote": raw.get("job_is_remote", False),
+                    "work_arrangement": "remote" if raw.get("job_is_remote") else "onsite",
+                    "employment_type": (raw.get("job_employment_type") or "FULLTIME").upper(),
+                    "salary_min": self._to_str(raw.get("job_min_salary")),
+                    "salary_max": self._to_str(raw.get("job_max_salary")),
+                    "salary_currency": raw.get("job_salary_currency", "USD"),
+                    "salary_period": raw.get("job_salary_period", "").lower() or None,
+                    "apply_url": raw.get("job_apply_link", ""),
+                    "apply_options": raw.get("apply_options"),
+                    "posted_at": self._parse_iso(raw.get("job_posted_at_datetime_utc")),
+                    "application_deadline": self._parse_iso(raw.get("job_offer_expiration_datetime_utc")),
+                    "required_experience_years": self._extract_years(raw.get("job_required_experience")),
+                    "required_education": self._extract_education(raw.get("job_required_education")),
+                    "skills": raw.get("job_required_skills") or [],
+                    "benefits": self._extract_highlights_benefits(raw.get("job_highlights")),
+                    "key_responsibilities": self._extract_highlights_responsibilities(raw.get("job_highlights")),
+                }
+
+            elif source == "adzuna":
+                company_obj = raw.get("company") or {}
+                location_obj = raw.get("location") or {}
+                extracted = {
+                    "title": raw.get("title", ""),
+                    "company": company_obj.get("display_name", "Unknown") if isinstance(company_obj, dict) else str(company_obj),
+                    "description": raw.get("description", ""),
+                    "city": location_obj.get("display_name") if isinstance(location_obj, dict) else None,
+                    "country": raw.get("_adzuna_country", ""),
+                    "is_remote": self._detect_remote_from_text(raw.get("title", "") + " " + raw.get("description", "")),
+                    "work_arrangement": "remote" if self._detect_remote_from_text(raw.get("title", "") + " " + raw.get("description", "")) else "onsite",
+                    "employment_type": (raw.get("contract_type") or "FULLTIME").upper(),
+                    "salary_min": self._to_str(raw.get("salary_min")),
+                    "salary_max": self._to_str(raw.get("salary_max")),
+                    "salary_currency": raw.get("salary_currency") or ("GBP" if raw.get("_adzuna_country") == "gb" else "USD"),
+                    "apply_url": raw.get("redirect_url", ""),
+                    "posted_at": self._parse_iso(raw.get("created")),
+                    "latitude": raw.get("latitude"),
+                    "longitude": raw.get("longitude"),
+                    "tags": [raw.get("category", {}).get("label")] if isinstance(raw.get("category"), dict) else [],
+                }
+
+            elif source == "hackernews":
+                extracted = {
+                    "title": raw.get("title", ""),
+                    "company": raw.get("company", "Unknown"),
+                    "description": raw.get("description") or raw.get("_raw_text", ""),
+                    "country": raw.get("location_raw"),
+                    "is_remote": raw.get("remote", False),
+                    "work_arrangement": "remote" if raw.get("remote") else "onsite",
+                    "apply_url": raw.get("apply_url", ""),
+                    "posted_at": self._parse_epoch(raw.get("hn_time")) or self._parse_iso(raw.get("posted_at")),
+                    "source_url": raw.get("apply_url"),
+                    "tags": [],
+                }
+
+            elif source == "rss_feed":
+                extracted = {
+                    "title": raw.get("title", ""),
+                    "company": raw.get("company", "Unknown"),
+                    "description": raw.get("description") or raw.get("_description_html", ""),
+                    "country": raw.get("location_raw"),
+                    "is_remote": raw.get("remote", True),
+                    "work_arrangement": "remote" if raw.get("remote", True) else "onsite",
+                    "apply_url": raw.get("apply_url") or raw.get("link", ""),
+                    "posted_at": self._parse_posted_at(raw.get("posted_at")),
+                    "tags": raw.get("_tags") or [],
+                }
+
+            elif source == "ats_scraper":
+                # ATS scraper already outputs semi-structured data
+                location = raw.get("location") or {}
+                extracted = {
+                    "title": raw.get("title", ""),
+                    "company": raw.get("company", "Unknown"),
+                    "description": raw.get("description", ""),
+                    "city": location.get("city") if isinstance(location, dict) else None,
+                    "country": location.get("country") if isinstance(location, dict) else None,
+                    "is_remote": location.get("remote", False) if isinstance(location, dict) else False,
+                    "employment_type": raw.get("employment_type"),
+                    "apply_url": raw.get("apply_url", ""),
+                    "posted_at": self._parse_iso(raw.get("posted_at")),
+                }
+
+            else:
+                logger.warning(f"Unknown source: {source}")
+                return None
+
+            # Validate minimum required fields
+            if not extracted.get("title") or not extracted.get("description"):
+                return None
+
+            # Run rule-based skill extraction
+            title = extracted.get("title", "")
+            desc = extracted.get("description", "")
+            if not extracted.get("skills"):
+                extracted["skills"] = self.skills_extractor.extract(title, desc)
+            if not extracted.get("category"):
+                extracted["category"] = self.skills_extractor.categorize_role(title, desc, extracted.get("skills", []))
+
+            return self._finalize_job(source, raw, extracted)
+
+        except Exception as e:
+            logger.error(f"[{source}] Fallback extraction failed: {e}")
+            return None
+
+    # ------------------------------------------------------------------
+    # Finalize: add system fields (id, source, raw_data, hashes, etc.)
+    # ------------------------------------------------------------------
+
+    def _finalize_job(self, source: str, raw_job: Dict[str, Any],
+                      extracted: Dict[str, Any]) -> Dict[str, Any]:
+        """Add system-level fields that aren't part of AI extraction."""
         
-        if not jobs:
-            return {}
-        
-        total = len(jobs)
-        
-        with_skills = sum(1 for j in jobs if j.get('skills'))
-        with_category = sum(1 for j in jobs if j.get('ai_category'))
-        with_quality = sum(1 for j in jobs if j.get('ai_quality_score'))
-        with_urgency = sum(1 for j in jobs if j.get('ai_urgency'))
-        with_deadline = sum(1 for j in jobs if j.get('ai_extracted_deadline'))
-        
-        avg_quality = sum(j.get('ai_quality_score', 0) for j in jobs) / total if total > 0 else 0
-        avg_skills = sum(len(j.get('skills', [])) for j in jobs) / total if total > 0 else 0
-        
-        return {
-            'total_jobs': total,
-            'enrichment_coverage': {
-                'skills': f"{with_skills}/{total} ({with_skills/total*100:.1f}%)",
-                'category': f"{with_category}/{total} ({with_category/total*100:.1f}%)",
-                'quality_score': f"{with_quality}/{total} ({with_quality/total*100:.1f}%)",
-                'urgency': f"{with_urgency}/{total} ({with_urgency/total*100:.1f}%)",
-                'deadline': f"{with_deadline}/{total} ({with_deadline/total*100:.1f}%)"
-            },
-            'averages': {
-                'quality_score': round(avg_quality, 1),
-                'skills_per_job': round(avg_skills, 1)
-            }
+        job = extracted.copy()
+
+        # Source identity
+        job["source"] = source
+        job["source_id"] = self._derive_source_id(source, raw_job)
+        job["id"] = f"{source}_{job['source_id']}"
+
+        # Store full raw data as backup
+        job["raw_data"] = raw_job
+
+        # Ensure posted_at has a value
+        if not job.get("posted_at"):
+            job["posted_at"] = datetime.now(timezone.utc)
+
+        # Parse application_deadline if it's a string
+        if isinstance(job.get("application_deadline"), str):
+            job["application_deadline"] = self._parse_iso(job["application_deadline"])
+
+        # Ensure company has a value
+        if not job.get("company"):
+            job["company"] = "Unknown"
+
+        # Quality score (rule-based, fast)
+        job["quality_score"] = self.quality_scorer.score(job)
+
+        # Title+company hash for dedup
+        title = job.get("title", "")
+        company = job.get("company", "")
+        job["title_company_hash"] = hashlib.sha256(
+            f"{title.lower().strip()}_{company.lower().strip()}".encode()
+        ).hexdigest()[:16]
+
+        # Build legacy location blob for backward compatibility
+        job["location"] = {
+            "city": job.get("city"),
+            "country": job.get("country"),
+            "remote": job.get("is_remote", False),
         }
+
+        # Ensure apply_url has a value
+        if not job.get("apply_url"):
+            job["apply_url"] = job.get("source_url") or "https://unknown"
+
+        return job
+
+    # ------------------------------------------------------------------
+    # Source ID derivation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _derive_source_id(source: str, raw: Dict[str, Any]) -> str:
+        """Extract or generate a unique source_id from raw data."""
+        # Try common ID field names
+        for key in ("id", "job_id", "source_id", "hn_comment_id", "entry_id"):
+            val = raw.get(key)
+            if val:
+                return str(val)
+        
+        # Fallback: hash some identifying fields
+        text = json.dumps(raw.get("title", "") + raw.get("company", ""), default=str)
+        return hashlib.md5(text.encode()).hexdigest()[:16]
+
+    # ------------------------------------------------------------------
+    # Helper: date parsing
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_epoch(value) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            return datetime.fromtimestamp(int(value), tz=timezone.utc)
+        except (ValueError, TypeError, OSError):
+            return None
+
+    @staticmethod
+    def _parse_iso(value) -> Optional[datetime]:
+        if not value:
+            return None
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        try:
+            from dateutil import parser as dateutil_parser
+            return dateutil_parser.isoparse(str(value))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _parse_posted_at(value) -> Optional[datetime]:
+        """Parse posted_at which could be datetime, ISO string, or epoch."""
+        if not value:
+            return None
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        if isinstance(value, (int, float)):
+            try:
+                return datetime.fromtimestamp(int(value), tz=timezone.utc)
+            except (ValueError, TypeError, OSError):
+                return None
+        try:
+            from dateutil import parser as dateutil_parser
+            return dateutil_parser.isoparse(str(value))
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------------
+    # Helper: field extraction utilities
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _to_str(value) -> Optional[str]:
+        if value is None:
+            return None
+        return str(value)
+
+    @staticmethod
+    def _detect_remote_from_text(text: str) -> bool:
+        return bool(re.search(r'\b(remote|work from home|wfh|telecommut|anywhere)\b', text.lower()))
+
+    @staticmethod
+    def _extract_years(exp_obj) -> Optional[int]:
+        """Extract min years from JSearch job_required_experience object."""
+        if not exp_obj or not isinstance(exp_obj, dict):
+            return None
+        min_years = exp_obj.get("required_experience_in_months")
+        if min_years:
+            return max(1, int(min_years) // 12)
+        no_exp = exp_obj.get("no_experience_required")
+        if no_exp:
+            return 0
+        return None
+
+    @staticmethod
+    def _extract_education(edu_obj) -> Optional[str]:
+        """Extract education from JSearch job_required_education object."""
+        if not edu_obj or not isinstance(edu_obj, dict):
+            return None
+        for key in ("degree_preferred", "degree_mentioned"):
+            if edu_obj.get(key):
+                return "Bachelor's"  # JSearch only flags presence, not level
+        return None
+
+    @staticmethod
+    def _extract_highlights_benefits(highlights) -> Optional[List[str]]:
+        if not highlights or not isinstance(highlights, dict):
+            return None
+        return highlights.get("Benefits") or highlights.get("benefits")
+
+    @staticmethod
+    def _extract_highlights_responsibilities(highlights) -> Optional[List[str]]:
+        if not highlights or not isinstance(highlights, dict):
+            return None
+        return highlights.get("Responsibilities") or highlights.get("responsibilities")

@@ -13,6 +13,7 @@ from src.agents.jsearch import JSearchFetcher
 from src.agents.remoteok import RemoteOKFetcher
 from src.agents.hackernews import HackerNewsFetcher
 from src.agents.rss_feed import RSSFeedFetcher
+from src.agents.ats_scraper import ATSScraperFetcher
 from src.database.operations import db
 from src.enrichment.enrichment_pipeline import EnrichmentPipeline
 from src.utils.config import settings
@@ -20,35 +21,41 @@ from src.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
-FETCHER_CLASSES = [RemoteOKFetcher, JSearchFetcher, AdzunaFetcher, HackerNewsFetcher, RSSFeedFetcher]
+FETCHER_CLASSES = [RemoteOKFetcher, JSearchFetcher, AdzunaFetcher, HackerNewsFetcher, RSSFeedFetcher, ATSScraperFetcher]
 
-# Initialize enrichment pipeline
-enrichment_pipeline = EnrichmentPipeline(use_ai=settings.enable_ai_enrichment)
+# Single pipeline: Raw → AI → Structured (no normalizer)
+pipeline = EnrichmentPipeline(use_ai=settings.enable_ai_enrichment)
 
 
 async def run_ingestion_cycle() -> Dict[str, Any]:
-    """Fetch jobs from all sources and persist them."""
+    """Fetch raw → AI process → Save. No normalizer step."""
 
     fetchers = [fetcher_cls() for fetcher_cls in FETCHER_CLASSES]
     results = await asyncio.gather(*(_collect_jobs(fetcher) for fetcher in fetchers))
 
     all_jobs: List[Dict[str, Any]] = []
     per_source: Dict[str, int] = {}
+    per_source_raw: Dict[str, int] = {}
 
-    for source_name, jobs in results:
-        per_source[source_name] = len(jobs)
-        all_jobs.extend(jobs)
+    # Process each source through the pipeline
+    for source_name, raw_jobs in results:
+        per_source_raw[source_name] = len(raw_jobs)
 
-    # Enrich jobs before saving to database
-    if all_jobs and settings.enable_ai_enrichment:
-        logger.info(f"Enriching {len(all_jobs)} jobs...")
-        try:
-            all_jobs = enrichment_pipeline.enrich_batch(all_jobs)
-            logger.info("Enrichment complete")
-        except Exception as e:
-            logger.error(f"Enrichment failed: {e}")
-            # Continue with unenriched jobs
+        if not raw_jobs:
+            per_source[source_name] = 0
+            continue
 
+        # SINGLE STEP: Raw → AI → Structured jobs
+        processed_jobs = await pipeline.process_source(source_name, raw_jobs)
+        per_source[source_name] = len(processed_jobs)
+        all_jobs.extend(processed_jobs)
+
+        logger.info("[%s] Raw: %d → Processed: %d", source_name, len(raw_jobs), len(processed_jobs))
+
+    logger.info("Total: %d raw → %d processed",
+                sum(per_source_raw.values()), len(all_jobs))
+
+    # Save to database
     db_stats = await db.save_jobs(all_jobs) if all_jobs else {"new": 0, "skipped": 0}
 
     summary = {

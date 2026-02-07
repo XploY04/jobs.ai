@@ -17,23 +17,30 @@ logger = setup_logger(__name__)
 class RSSFeedFetcher(BaseFetcher):
     """
     Generic RSS feed fetcher for job boards.
-    
-    Supports common job board RSS feeds like:
-    - Stack Overflow Jobs RSS
-    - GitHub Jobs RSS  
-    - Indie Hackers job board
-    - We Work Remotely RSS
-    - Other RSS/Atom feeds with job listings
+    Returns ALL raw entries — no filtering, no normalization.
     """
 
-    # Curated list of backend/devops job RSS feeds
+    # Comprehensive list of tech job RSS feeds (ALL tech roles, not just backend)
     DEFAULT_FEEDS = [
-        "https://stackoverflow.com/jobs/feed?q=backend+engineer&r=true",
-        "https://stackoverflow.com/jobs/feed?q=devops+engineer&r=true", 
+        # We Work Remotely — ALL tech categories
         "https://weworkremotely.com/categories/remote-back-end-programming-jobs.rss",
+        "https://weworkremotely.com/categories/remote-front-end-programming-jobs.rss",
+        "https://weworkremotely.com/categories/remote-full-stack-programming-jobs.rss",
         "https://weworkremotely.com/categories/remote-devops-sysadmin-jobs.rss",
+        "https://weworkremotely.com/categories/remote-product-jobs.rss",
+        "https://weworkremotely.com/categories/remote-design-jobs.rss",
+        # RemoteOK RSS — various categories
+        "https://remoteok.com/remote-dev-jobs.rss",
         "https://remoteok.com/remote-backend-jobs.rss",
+        "https://remoteok.com/remote-frontend-jobs.rss",
         "https://remoteok.com/remote-devops-jobs.rss",
+        "https://remoteok.com/remote-data-jobs.rss",
+        "https://remoteok.com/remote-machine-learning-jobs.rss",
+        "https://remoteok.com/remote-security-jobs.rss",
+        "https://remoteok.com/remote-golang-jobs.rss",
+        "https://remoteok.com/remote-python-jobs.rss",
+        "https://remoteok.com/remote-react-jobs.rss",
+        "https://remoteok.com/remote-rust-jobs.rss",
     ]
 
     def __init__(self, feed_urls: Optional[List[str]] = None) -> None:
@@ -41,8 +48,8 @@ class RSSFeedFetcher(BaseFetcher):
         self.feed_urls = feed_urls or self.DEFAULT_FEEDS
 
     async def fetch_jobs(self) -> List[Dict[str, Any]]:
-        """Fetch jobs from all configured RSS feeds"""
-        logger.info("[%s] Fetching from %d RSS feeds", self.source_name, len(self.feed_urls))
+        """Fetch ALL jobs from all configured RSS feeds — no filtering"""
+        logger.info("[%s] Fetching from %d RSS feeds (ALL jobs, no filtering)", self.source_name, len(self.feed_urls))
         
         all_jobs = []
         async with aiohttp.ClientSession() as session:
@@ -54,15 +61,19 @@ class RSSFeedFetcher(BaseFetcher):
         seen_ids = set()
         unique_jobs = []
         for job in all_jobs:
-            if job["source_id"] not in seen_ids:
-                seen_ids.add(job["source_id"])
+            sid = job.get("source_id") or job.get("_entry_id", "")
+            if sid and sid not in seen_ids:
+                seen_ids.add(sid)
+                unique_jobs.append(job)
+            elif not sid:
                 unique_jobs.append(job)
         
-        logger.info("[%s] Found %d unique jobs from %d feeds", self.source_name, len(unique_jobs), len(self.feed_urls))
+        logger.info("[%s] Fetched %d unique jobs from %d feeds (ALL - no filtering)", 
+                    self.source_name, len(unique_jobs), len(self.feed_urls))
         return unique_jobs
 
     async def _fetch_feed(self, session: aiohttp.ClientSession, feed_url: str) -> List[Dict[str, Any]]:
-        """Fetch and parse a single RSS feed"""
+        """Fetch and parse a single RSS feed — return ALL entries raw"""
         try:
             async with session.get(feed_url, timeout=30) as response:
                 if response.status != 200:
@@ -79,12 +90,12 @@ class RSSFeedFetcher(BaseFetcher):
                 return []
             
             jobs = []
-            for entry in feed.entries[:100]:  # Limit to 100 entries per feed
+            for entry in feed.entries[:200]:  # Increased limit to 200 entries per feed
                 job = self._parse_entry(entry, feed_url)
-                if job and self.is_backend_devops_job(job["title"], job["description"]):
-                    jobs.append(job)
+                if job:
+                    jobs.append(job)  # NO filtering — return ALL entries
             
-            logger.info("[%s] Extracted %d jobs from: %s", self.source_name, len(jobs), feed_url)
+            logger.info("[%s] Fetched %d entries from: %s", self.source_name, len(jobs), feed_url)
             return jobs
             
         except Exception as exc:
@@ -92,7 +103,7 @@ class RSSFeedFetcher(BaseFetcher):
             return []
 
     def _parse_entry(self, entry: Any, feed_url: str) -> Optional[Dict[str, Any]]:
-        """Parse an RSS entry into a normalized job dict"""
+        """Parse an RSS entry into raw job data with ALL available fields"""
         try:
             # Extract basic fields
             title = entry.get("title", "").strip()
@@ -106,8 +117,9 @@ class RSSFeedFetcher(BaseFetcher):
             elif hasattr(entry, "content") and entry.content:
                 description = entry.content[0].value
             
-            # Clean HTML from description
-            description = self._strip_html(description)
+            # Keep both raw HTML and cleaned text
+            description_html = description
+            description_clean = self._strip_html(description)
             
             # Extract URL
             apply_url = entry.get("link", "")
@@ -116,33 +128,40 @@ class RSSFeedFetcher(BaseFetcher):
             if apply_url:
                 source_id = hashlib.md5(apply_url.encode()).hexdigest()[:16]
             else:
-                source_id = hashlib.md5((title + description[:100]).encode()).hexdigest()[:16]
+                source_id = hashlib.md5((title + description_clean[:100]).encode()).hexdigest()[:16]
             
             # Extract published date
             posted_at = self._parse_date(entry)
             
             # Try to extract company from title or description
-            company = self._extract_company(title, description)
+            company = self._extract_company(title, description_clean)
             
             # Extract location
-            location = self._extract_location_from_entry(entry, title, description)
+            location_raw = self._extract_location_from_entry(entry, title, description_clean)
             
+            # Extract all tags/categories
+            tags = []
+            if hasattr(entry, "tags"):
+                tags = [tag.get("term", "") for tag in entry.tags if tag.get("term")]
+            
+            # Return RAW data with ALL fields
             return {
-                "source": self.source_name,
+                "_source": self.source_name,
+                "_feed_url": feed_url,
+                "_entry_id": source_id,
+                "_description_html": description_html[:10000],
+                "_tags": tags,
                 "source_id": source_id,
-                "title": title[:200],
-                "company": company[:100],
-                "description": description[:5000],
-                "location": {
-                    "city": None,
-                    "country": None,
-                    "remote": "remote" in location.lower() if location else False,
-                },
-                "employment_type": "full-time",
-                "salary_min": None,
-                "salary_max": None,
-                "apply_url": apply_url or "https://example.com",
+                "title": title[:500],
+                "company": company[:200],
+                "description": description_clean[:10000],
+                "location_raw": location_raw,
+                "remote": "remote" in location_raw.lower() if location_raw else False,
+                "apply_url": apply_url or "",
                 "posted_at": posted_at,
+                # Pass through any extra fields from the entry
+                "author": getattr(entry, "author", None),
+                "entry_id": getattr(entry, "id", None),
             }
             
         except Exception as exc:

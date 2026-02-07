@@ -2,7 +2,7 @@ import hashlib
 import ssl
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import select, func, or_
+from sqlalchemy import select, func, or_, Boolean
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.engine.url import make_url
@@ -84,8 +84,10 @@ class Database:
         async with self.session_maker() as session:
             for job_data in jobs:
                 try:
-                    job_id = f"{job_data['source']}_{job_data['source_id']}"
-                    title_company_hash = self._hash_title_company(job_data['title'], job_data['company'])
+                    job_id = job_data.get('id') or f"{job_data['source']}_{job_data['source_id']}"
+                    title_company_hash = job_data.get('title_company_hash') or self._hash_title_company(
+                        job_data.get('title', ''), job_data.get('company', '')
+                    )
 
                     exists = await session.get(Job, job_id)
                     if exists:
@@ -99,25 +101,58 @@ class Database:
                         stats["skipped"] += 1
                         continue
 
-                    salary_min = self._to_str(job_data.get('salary_min'))
-                    salary_max = self._to_str(job_data.get('salary_max'))
-
                     job = Job(
+                        # ── Identity ──
                         id=job_id,
-                        source=job_data['source'],
-                        source_id=job_data['source_id'],
-                        title=job_data['title'],
-                        company=job_data['company'],
-                        description=job_data['description'],
-                        location=job_data['location'],
+                        source=job_data.get('source', ''),
+                        source_id=str(job_data.get('source_id', '')),
+                        source_url=job_data.get('source_url'),
+                        # ── Core Job Info ──
+                        title=job_data.get('title', ''),
+                        company=job_data.get('company', 'Unknown'),
+                        company_logo=job_data.get('company_logo'),
+                        company_website=job_data.get('company_website'),
+                        description=job_data.get('description', ''),
+                        short_description=job_data.get('short_description'),
+                        # ── Location ──
+                        location=job_data.get('location'),
+                        country=job_data.get('country'),
+                        city=job_data.get('city'),
+                        state=job_data.get('state'),
+                        is_remote=job_data.get('is_remote'),
+                        work_arrangement=job_data.get('work_arrangement'),
+                        latitude=job_data.get('latitude'),
+                        longitude=job_data.get('longitude'),
+                        # ── Employment Details ──
                         employment_type=job_data.get('employment_type'),
-                        salary_min=salary_min,
-                        salary_max=salary_max,
+                        seniority_level=job_data.get('seniority_level'),
+                        department=job_data.get('department'),
+                        category=job_data.get('category'),
+                        # ── Compensation ──
+                        salary_min=self._to_str(job_data.get('salary_min')),
+                        salary_max=self._to_str(job_data.get('salary_max')),
                         salary_currency=job_data.get('salary_currency'),
-                        apply_url=job_data['apply_url'],
-                        posted_at=job_data['posted_at'],
-                        title_company_hash=title_company_hash,
+                        salary_period=job_data.get('salary_period'),
+                        # ── Skills & Requirements ──
+                        skills=job_data.get('skills'),
+                        required_experience_years=job_data.get('required_experience_years'),
+                        required_education=job_data.get('required_education'),
+                        key_responsibilities=job_data.get('key_responsibilities'),
+                        nice_to_have_skills=job_data.get('nice_to_have_skills'),
+                        # ── Benefits & Perks ──
+                        benefits=job_data.get('benefits'),
+                        visa_sponsorship=job_data.get('visa_sponsorship'),
+                        # ── Dates ──
+                        posted_at=job_data.get('posted_at'),
+                        application_deadline=job_data.get('application_deadline'),
+                        # ── Apply ──
+                        apply_url=job_data.get('apply_url', ''),
+                        apply_options=job_data.get('apply_options'),
+                        # ── Quality / Meta ──
+                        tags=job_data.get('tags'),
+                        quality_score=job_data.get('quality_score'),
                         raw_data=job_data.get('raw_data'),
+                        title_company_hash=title_company_hash,
                     )
 
                     session.add(job)
@@ -145,25 +180,22 @@ class Database:
             return value
         return str(value)
 
-    async def list_jobs(
+    async def count_jobs(
         self,
         *,
-        limit: int = 50,
-        offset: int = 0,
         search: Optional[str] = None,
         sources: Optional[List[str]] = None,
         employment_type: Optional[str] = None,
         remote_only: bool = False,
-    ) -> List[Job]:
-        """Return paginated jobs with lightweight filtering."""
+        seniority: Optional[List[str]] = None,
+        category: Optional[List[str]] = None,
+    ) -> int:
+        """Count total jobs matching the filters."""
 
         if not self.session_maker:
             raise RuntimeError("Database session maker not initialized")
 
-        limit = max(1, min(limit, 200))
-        offset = max(0, offset)
-
-        stmt = select(Job).order_by(Job.posted_at.desc()).offset(offset).limit(limit)
+        stmt = select(func.count(Job.id))
 
         if search:
             pattern = f"%{search.lower()}%"
@@ -181,12 +213,75 @@ class Database:
         if employment_type:
             stmt = stmt.where(func.lower(Job.employment_type) == employment_type.lower())
 
+        if remote_only:
+            stmt = stmt.where(Job.is_remote == True)
+
+        if seniority:
+            seniority_lower = [s.lower() for s in seniority]
+            stmt = stmt.where(func.lower(Job.seniority_level).in_(seniority_lower))
+
+        if category:
+            category_lower = [c.lower() for c in category]
+            stmt = stmt.where(func.lower(Job.category).in_(category_lower))
+
+        async with self.session_maker() as session:
+            result = await session.execute(stmt)
+            return result.scalar() or 0
+
+    async def list_jobs(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        search: Optional[str] = None,
+        sources: Optional[List[str]] = None,
+        employment_type: Optional[str] = None,
+        remote_only: bool = False,
+        seniority: Optional[List[str]] = None,
+        category: Optional[List[str]] = None,
+    ) -> List[Job]:
+        """Return paginated jobs with lightweight filtering."""
+
+        if not self.session_maker:
+            raise RuntimeError("Database session maker not initialized")
+
+        limit = max(1, min(limit, 200))
+        offset = max(0, offset)
+
+        stmt = select(Job).order_by(Job.posted_at.desc())
+
+        if search:
+            pattern = f"%{search.lower()}%"
+            stmt = stmt.where(
+                or_(
+                    func.lower(Job.title).like(pattern),
+                    func.lower(Job.description).like(pattern),
+                    func.lower(Job.company).like(pattern),
+                )
+            )
+
+        if sources:
+            stmt = stmt.where(Job.source.in_(sources))
+
+        if employment_type:
+            stmt = stmt.where(func.lower(Job.employment_type) == employment_type.lower())
+
+        if remote_only:
+            stmt = stmt.where(Job.is_remote == True)
+
+        if seniority:
+            seniority_lower = [s.lower() for s in seniority]
+            stmt = stmt.where(func.lower(Job.seniority_level).in_(seniority_lower))
+
+        if category:
+            category_lower = [c.lower() for c in category]
+            stmt = stmt.where(func.lower(Job.category).in_(category_lower))
+
+        stmt = stmt.offset(offset).limit(limit)
+
         async with self.session_maker() as session:
             result = await session.execute(stmt)
             jobs = result.scalars().all()
-
-        if remote_only:
-            jobs = [job for job in jobs if (job.location or {}).get("remote")]
 
         return jobs
 
@@ -198,6 +293,62 @@ class Database:
 
         async with self.session_maker() as session:
             return await session.get(Job, job_id)
+
+    async def get_filter_options(self) -> Dict[str, Any]:
+        """Get available filter options with job counts."""
+
+        if not self.session_maker:
+            raise RuntimeError("Database session maker not initialized")
+
+        async with self.session_maker() as session:
+            # Get seniority options
+            seniority_result = await session.execute(
+                select(Job.seniority_level, func.count(Job.id))
+                .where(Job.seniority_level.isnot(None))
+                .group_by(Job.seniority_level)
+                .order_by(func.count(Job.id).desc())
+            )
+            seniority = [
+                {"value": row[0], "count": row[1]} 
+                for row in seniority_result.all()
+            ]
+
+            # Get category options
+            category_result = await session.execute(
+                select(Job.category, func.count(Job.id))
+                .where(Job.category.isnot(None))
+                .group_by(Job.category)
+                .order_by(func.count(Job.id).desc())
+            )
+            categories = [
+                {"value": row[0], "count": row[1]} 
+                for row in category_result.all()
+            ]
+
+            # Get source options
+            source_result = await session.execute(
+                select(Job.source, func.count(Job.id))
+                .group_by(Job.source)
+                .order_by(func.count(Job.id).desc())
+            )
+            sources = [
+                {"value": row[0], "count": row[1]} 
+                for row in source_result.all()
+            ]
+
+            # Count remote jobs
+            remote_result = await session.execute(
+                select(func.count(Job.id))
+                .where(Job.is_remote == True)
+            )
+            remote_count = remote_result.scalar() or 0
+
+            return {
+                "seniority": seniority,
+                "category": categories,
+                "sources": sources,
+                "remote_count": remote_count,
+            }
 
 
 db = Database()

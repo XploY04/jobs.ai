@@ -8,7 +8,7 @@ import asyncio
 import hashlib
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, Any, List, Optional
 
 from src.enrichment.ai_processor import AIProcessor
@@ -18,6 +18,9 @@ from src.utils.logger import setup_logger
 from src.utils.config import settings
 
 logger = setup_logger(__name__)
+
+# Jobs older than this are dropped during ingestion
+MAX_JOB_AGE_DAYS = 15
 
 
 class EnrichmentPipeline:
@@ -111,7 +114,9 @@ class EnrichmentPipeline:
                     finalized = []
                     for raw_job, ai_result in zip(chunk, ai_results):
                         if ai_result:
-                            finalized.append(self._finalize_job(source, raw_job, ai_result))
+                            result = self._finalize_job(source, raw_job, ai_result)
+                            if result:
+                                finalized.append(result)
                         else:
                             fb = self._fallback_extract(source, raw_job)
                             if fb:
@@ -302,7 +307,7 @@ class EnrichmentPipeline:
     # ------------------------------------------------------------------
 
     def _finalize_job(self, source: str, raw_job: Dict[str, Any],
-                      extracted: Dict[str, Any]) -> Dict[str, Any]:
+                      extracted: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Add system-level fields that aren't part of AI extraction."""
         
         job = extracted.copy()
@@ -328,6 +333,13 @@ class EnrichmentPipeline:
         # Ensure posted_at has a value
         if not job.get("posted_at"):
             job["posted_at"] = datetime.now(timezone.utc)
+
+        # Drop jobs older than MAX_JOB_AGE_DAYS
+        cutoff = datetime.now(timezone.utc) - timedelta(days=MAX_JOB_AGE_DAYS)
+        posted = job["posted_at"]
+        if isinstance(posted, datetime) and posted < cutoff:
+            logger.debug("[%s] Dropping old job '%s' (posted %s)", source, job.get('title', ''), posted.date())
+            return None
 
         # Parse application_deadline if it's a string
         if isinstance(job.get("application_deadline"), str):

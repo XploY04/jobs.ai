@@ -24,7 +24,7 @@ class JobResponse(BaseModel):
     short_description: Optional[str] = None
 
     # ── Location ──
-    location: Optional[Union[Dict, List]] = None  # legacy blob
+    location: Optional[Union[Dict, List, str]] = None  # legacy blob
     country: Optional[str] = None
     city: Optional[str] = None
     state: Optional[str] = None

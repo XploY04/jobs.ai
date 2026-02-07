@@ -9,7 +9,7 @@ import hashlib
 import json
 import re
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional
+from typing import Callable, Dict, Any, List, Optional
 
 from src.enrichment.ai_processor import AIProcessor
 from src.enrichment.skills_extractor import SkillsExtractor
@@ -42,13 +42,22 @@ class EnrichmentPipeline:
     # Main entry point: process raw jobs from a source
     # ------------------------------------------------------------------
 
-    async def process_source(self, source_name: str, raw_jobs: List[Dict[str, Any]],
-                             max_concurrent: int = 20) -> List[Dict[str, Any]]:
+    async def process_source(
+        self,
+        source_name: str,
+        raw_jobs: List[Dict[str, Any]],
+        batch_size: int = 5,
+        max_concurrent: int = 10,
+        on_batch_ready: Optional[Callable] = None,
+    ) -> List[Dict[str, Any]]:
         """
         Process ALL raw jobs from a single source into final structured format.
         
-        This replaces both normalize_raw_jobs() and enrich_batch_async().
-        Raw data goes in, fully structured jobs come out.
+        Uses BATCH AI processing: sends `batch_size` jobs per Gemini call,
+        with up to `max_concurrent` batch calls in parallel.
+        
+        If `on_batch_ready` is provided, each finished batch is passed to it
+        immediately (e.g. for saving to DB) instead of accumulating in memory.
         """
         if not raw_jobs:
             return []
@@ -56,49 +65,82 @@ class EnrichmentPipeline:
         logger.info(f"[{source_name}] Processing {len(raw_jobs)} raw jobs...")
 
         if self.use_ai and self.ai_processor and self.ai_processor.enabled:
-            jobs = await self._process_with_ai(source_name, raw_jobs, max_concurrent)
+            jobs = await self._process_with_ai(source_name, raw_jobs, batch_size, max_concurrent, on_batch_ready)
         else:
             jobs = self._process_with_fallback(source_name, raw_jobs)
+            if on_batch_ready and jobs:
+                await on_batch_ready(jobs)
 
         logger.info(f"[{source_name}] Processed: {len(jobs)}/{len(raw_jobs)} jobs")
         return jobs
 
     # ------------------------------------------------------------------
-    # AI-powered processing (primary path)
+    # AI-powered processing (primary path — batched)
     # ------------------------------------------------------------------
 
     async def _process_with_ai(self, source: str, raw_jobs: List[Dict[str, Any]],
-                                max_concurrent: int) -> List[Dict[str, Any]]:
-        """Send raw jobs to Gemini for structured extraction."""
-        semaphore = asyncio.Semaphore(max_concurrent)
-        completed = 0
-        total = len(raw_jobs)
+                                batch_size: int, max_concurrent: int,
+                                on_batch_ready: Optional[Callable] = None) -> List[Dict[str, Any]]:
+        """Send raw jobs to Gemini in batches for structured extraction.
+        
+        Chunks raw_jobs into groups of `batch_size`, then fires up to
+        `max_concurrent` batch API calls in parallel using a dedicated thread pool.
+        
+        If `on_batch_ready` is provided, each batch is saved immediately after
+        processing — no accumulation in memory.
+        """
+        from concurrent.futures import ThreadPoolExecutor
 
-        async def process_one(raw_job: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-            nonlocal completed
+        semaphore = asyncio.Semaphore(max_concurrent)
+        total = len(raw_jobs)
+        executor = ThreadPoolExecutor(max_workers=max_concurrent)
+
+        # Split into chunks
+        chunks = [raw_jobs[i:i + batch_size] for i in range(0, total, batch_size)]
+        logger.info(f"[{source}] {total} jobs → {len(chunks)} batches of ≤{batch_size} (up to {max_concurrent} parallel)")
+
+        async def process_chunk(chunk_idx: int, chunk: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             async with semaphore:
                 try:
                     loop = asyncio.get_event_loop()
-                    ai_result = await loop.run_in_executor(
-                        None, self.ai_processor.process_raw_job, source, raw_job
+                    # Call _process_chunk directly — no double-chunking
+                    ai_results = await loop.run_in_executor(
+                        executor, self.ai_processor._process_chunk, source, chunk
                     )
 
-                    if ai_result:
-                        job = self._finalize_job(source, raw_job, ai_result)
-                        completed += 1
-                        if completed % 25 == 0:
-                            logger.info(f"[{source}] AI processed {completed}/{total}")
-                        return job
-                    else:
-                        # AI failed for this job — use fallback
-                        return self._fallback_extract(source, raw_job)
-                except Exception as e:
-                    logger.error(f"[{source}] AI processing error: {e}")
-                    return self._fallback_extract(source, raw_job)
+                    finalized = []
+                    for raw_job, ai_result in zip(chunk, ai_results):
+                        if ai_result:
+                            finalized.append(self._finalize_job(source, raw_job, ai_result))
+                        else:
+                            fb = self._fallback_extract(source, raw_job)
+                            if fb:
+                                finalized.append(fb)
 
-        tasks = [process_one(job) for job in raw_jobs]
-        results = await asyncio.gather(*tasks)
-        return [r for r in results if r is not None]
+                    # Save this batch to DB immediately if callback provided
+                    if on_batch_ready and finalized:
+                        await on_batch_ready(finalized)
+
+                    done = (chunk_idx + 1) * batch_size
+                    logger.info(f"[{source}] Batch {chunk_idx + 1}/{len(chunks)} done ({min(done, total)}/{total} jobs)")
+                    return finalized
+
+                except Exception as e:
+                    logger.error(f"[{source}] Batch {chunk_idx + 1} error: {e} — using fallback")
+                    fallbacks = [fb for raw_job in chunk if (fb := self._fallback_extract(source, raw_job))]
+                    if on_batch_ready and fallbacks:
+                        await on_batch_ready(fallbacks)
+                    return fallbacks
+
+        tasks = [process_chunk(i, chunk) for i, chunk in enumerate(chunks)]
+        batch_results = await asyncio.gather(*tasks)
+        executor.shutdown(wait=False)
+
+        # Flatten list of lists
+        all_jobs = []
+        for batch in batch_results:
+            all_jobs.extend(batch)
+        return all_jobs
 
     # ------------------------------------------------------------------
     # Fallback processing (no AI)
@@ -270,8 +312,18 @@ class EnrichmentPipeline:
         job["source_id"] = self._derive_source_id(source, raw_job)
         job["id"] = f"{source}_{job['source_id']}"
 
-        # Store full raw data as backup
-        job["raw_data"] = raw_job
+        # Store full raw data as backup (serialize datetimes for JSON column)
+        job["raw_data"] = json.loads(json.dumps(raw_job, default=str))
+
+        # Carry over source_url from raw data if AI didn't extract it
+        if not job.get("source_url"):
+            job["source_url"] = (
+                raw_job.get("apply_url")
+                or raw_job.get("url")
+                or raw_job.get("link")
+                or raw_job.get("job_apply_link")
+                or raw_job.get("redirect_url")
+            )
 
         # Ensure posted_at has a value
         if not job.get("posted_at"):
@@ -302,9 +354,17 @@ class EnrichmentPipeline:
             "remote": job.get("is_remote", False),
         }
 
-        # Ensure apply_url has a value
+        # Ensure apply_url has a value — prefer raw data's URL over AI guess
         if not job.get("apply_url"):
-            job["apply_url"] = job.get("source_url") or "https://unknown"
+            job["apply_url"] = (
+                raw_job.get("apply_url")
+                or raw_job.get("url")
+                or raw_job.get("link")
+                or raw_job.get("job_apply_link")
+                or raw_job.get("redirect_url")
+                or job.get("source_url")
+                or "https://unknown"
+            )
 
         return job
 

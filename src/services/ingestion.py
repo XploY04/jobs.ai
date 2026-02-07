@@ -28,45 +28,71 @@ pipeline = EnrichmentPipeline(use_ai=settings.enable_ai_enrichment)
 
 
 async def run_ingestion_cycle() -> Dict[str, Any]:
-    """Fetch raw → AI process → Save. No normalizer step."""
+    """Fetch raw → AI process → Save per batch. Each batch of ~5 jobs
+    hits the DB as soon as Gemini finishes processing it."""
 
     fetchers = [fetcher_cls() for fetcher_cls in FETCHER_CLASSES]
     results = await asyncio.gather(*(_collect_jobs(fetcher) for fetcher in fetchers))
 
-    all_jobs: List[Dict[str, Any]] = []
-    per_source: Dict[str, int] = {}
-    per_source_raw: Dict[str, int] = {}
+    # Thread-safe counters (only mutated inside async tasks, one event loop)
+    per_source: Dict[str, Dict[str, Any]] = {}
+    total_new = 0
+    total_skipped = 0
+    total_processed = 0
 
-    # Process each source through the pipeline
-    for source_name, raw_jobs in results:
-        per_source_raw[source_name] = len(raw_jobs)
+    async def _process_source(source_name: str, raw_jobs: List[Dict[str, Any]]) -> None:
+        nonlocal total_new, total_skipped, total_processed
 
         if not raw_jobs:
-            per_source[source_name] = 0
-            continue
+            per_source[source_name] = {"raw": 0, "processed": 0, "new": 0, "skipped": 0}
+            return
 
-        # SINGLE STEP: Raw → AI → Structured jobs
-        processed_jobs = await pipeline.process_source(source_name, raw_jobs)
-        per_source[source_name] = len(processed_jobs)
-        all_jobs.extend(processed_jobs)
+        source_stats = {"new": 0, "skipped": 0}
 
-        logger.info("[%s] Raw: %d → Processed: %d", source_name, len(raw_jobs), len(processed_jobs))
+        async def _save_batch(batch: List[Dict[str, Any]]) -> None:
+            """Called by the pipeline after each batch (~5 jobs) is processed."""
+            stats = await db.save_jobs(batch)
+            source_stats["new"] += stats["new"]
+            source_stats["skipped"] += stats["skipped"]
+            logger.info("[%s] Batch saved — new=%d skipped=%d", source_name, stats["new"], stats["skipped"])
 
-    logger.info("Total: %d raw → %d processed",
-                sum(per_source_raw.values()), len(all_jobs))
+        try:
+            processed = await pipeline.process_source(
+                source_name, raw_jobs, on_batch_ready=_save_batch
+            )
 
-    # Save to database
-    db_stats = await db.save_jobs(all_jobs) if all_jobs else {"new": 0, "skipped": 0}
+            per_source[source_name] = {
+                "raw": len(raw_jobs),
+                "processed": len(processed),
+                "new": source_stats["new"],
+                "skipped": source_stats["skipped"],
+            }
+            total_new += source_stats["new"]
+            total_skipped += source_stats["skipped"]
+            total_processed += len(processed)
+
+            logger.info("[%s] Done — raw=%d processed=%d new=%d skipped=%d",
+                        source_name, len(raw_jobs), len(processed),
+                        source_stats["new"], source_stats["skipped"])
+
+        except Exception as exc:
+            logger.error("[%s] Failed: %s", source_name, exc, exc_info=True)
+            per_source[source_name] = {"raw": len(raw_jobs), "processed": 0, "new": 0, "skipped": 0, "error": str(exc)}
+
+    # Process ALL sources concurrently — each batch saves independently
+    await asyncio.gather(
+        *(_process_source(name, jobs) for name, jobs in results)
+    )
 
     summary = {
         "sources": per_source,
-        "db": db_stats,
-        "total_jobs": len(all_jobs),
+        "db": {"new": total_new, "skipped": total_skipped},
+        "total_jobs": total_processed,
         "ran_at": datetime.now(timezone.utc).isoformat(),
     }
 
     logger.info(
-        "Ingestion finished | total=%s new=%s skipped=%s", summary["total_jobs"], db_stats["new"], db_stats["skipped"]
+        "Ingestion finished | total=%d new=%d skipped=%d", total_processed, total_new, total_skipped
     )
     return summary
 

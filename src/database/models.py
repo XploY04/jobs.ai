@@ -1,4 +1,5 @@
-from sqlalchemy import Column, String, Text, DateTime, JSON, Index, Integer, ARRAY, Boolean, Float
+from sqlalchemy import Column, String, Text, DateTime, JSON, Index, Integer, ARRAY, Boolean, Float, Computed
+from sqlalchemy.dialects.postgresql import TSVECTOR
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.sql import func
 
@@ -90,6 +91,9 @@ class Job(Base):
     raw_data = Column(JSON)  # full original API response (backup)
     title_company_hash = Column(String(64), index=True)
 
+    # ── Full-text search ──
+    search_vector = Column(TSVECTOR)  # auto-populated by DB trigger
+
     __table_args__ = (
         Index("idx_source_source_id", "source", "source_id", unique=True),
         Index("idx_posted_at", "posted_at"),
@@ -97,4 +101,5 @@ class Job(Base):
         Index("idx_skills_gin", "skills", postgresql_using="gin"),
         Index("idx_is_remote", "is_remote"),
         Index("idx_seniority", "seniority_level"),
+        Index("idx_search_vector", "search_vector", postgresql_using="gin"),
     )

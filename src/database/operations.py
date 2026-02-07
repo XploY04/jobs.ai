@@ -2,7 +2,7 @@ import hashlib
 import ssl
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import select, func, or_, Boolean
+from sqlalchemy import select, func, or_, Boolean, text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.engine.url import make_url
@@ -180,6 +180,21 @@ class Database:
             return value
         return str(value)
 
+    @staticmethod
+    def _build_tsquery(search: str) -> str:
+        """Convert user search string into a PostgreSQL tsquery.
+
+        - Splits on whitespace
+        - Strips non-alphanumeric chars
+        - Joins with '&' (AND) so all terms must match
+        - Appends ':*' for prefix matching ("pyth" matches "python")
+        """
+        import re
+        words = re.findall(r'[\w]+', search.strip())
+        if not words:
+            return ''
+        return ' & '.join(f"{w}:*" for w in words)
+
     async def count_jobs(
         self,
         *,
@@ -198,14 +213,8 @@ class Database:
         stmt = select(func.count(Job.id))
 
         if search:
-            pattern = f"%{search.lower()}%"
-            stmt = stmt.where(
-                or_(
-                    func.lower(Job.title).like(pattern),
-                    func.lower(Job.description).like(pattern),
-                    func.lower(Job.company).like(pattern),
-                )
-            )
+            tsquery = self._build_tsquery(search)
+            stmt = stmt.where(Job.search_vector.op('@@')(func.to_tsquery('english', tsquery)))
 
         if sources:
             stmt = stmt.where(Job.source.in_(sources))
@@ -248,17 +257,15 @@ class Database:
         limit = max(1, min(limit, 200))
         offset = max(0, offset)
 
-        stmt = select(Job).order_by(Job.posted_at.desc())
-
         if search:
-            pattern = f"%{search.lower()}%"
-            stmt = stmt.where(
-                or_(
-                    func.lower(Job.title).like(pattern),
-                    func.lower(Job.description).like(pattern),
-                    func.lower(Job.company).like(pattern),
-                )
-            )
+            tsquery = self._build_tsquery(search)
+            ts_expr = func.to_tsquery('english', tsquery)
+            rank = func.ts_rank_cd(Job.search_vector, ts_expr)
+            stmt = select(Job).where(
+                Job.search_vector.op('@@')(ts_expr)
+            ).order_by(rank.desc(), Job.posted_at.desc())
+        else:
+            stmt = select(Job).order_by(Job.posted_at.desc())
 
         if sources:
             stmt = stmt.where(Job.source.in_(sources))

@@ -128,9 +128,9 @@ INGESTION_INTERVAL_MINUTES=30
 
 ### Runtime Flags
 
-| Flag | Purpose |
-|------|---------|
-| `DISABLE_SCHEDULER=1` | Start API only, no auto-ingestion |
+| Flag                         | Purpose                                   |
+| ---------------------------- | ----------------------------------------- |
+| `DISABLE_SCHEDULER=1`        | Start API only, no auto-ingestion         |
 | `ENABLE_AI_ENRICHMENT=false` | Use rule-based fallback instead of Gemini |
 
 ---
@@ -177,16 +177,16 @@ GET /api/jobs?limit=50&offset=0&search=kubernetes&remote_only=true&category=devo
 
 **Query Parameters:**
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `limit` | int | Results per page (1-200, default 50) |
-| `offset` | int | Pagination offset (default 0) |
-| `search` | string | Full-text search across title, company, skills, description (min 2 chars) |
-| `source` | string[] | Filter by source: `remoteok`, `jsearch`, `adzuna`, `hackernews`, `rss_feed`, `ats_scraper` |
-| `employment_type` | string | `FULLTIME`, `PARTTIME`, `CONTRACT`, `INTERN` |
-| `remote_only` | bool | Filter remote jobs only |
-| `seniority` | string[] | `junior`, `mid`, `senior`, `staff`, `principal` |
-| `category` | string[] | `backend`, `frontend`, `fullstack`, `devops`, `data`, `ml`, `mobile`, `security`, `qa`, `general` |
+| Parameter         | Type     | Description                                                                                       |
+| ----------------- | -------- | ------------------------------------------------------------------------------------------------- |
+| `limit`           | int      | Results per page (1-200, default 50)                                                              |
+| `offset`          | int      | Pagination offset (default 0)                                                                     |
+| `search`          | string   | Full-text search across title, company, skills, description (min 2 chars)                         |
+| `source`          | string[] | Filter by source: `remoteok`, `jsearch`, `adzuna`, `hackernews`, `rss_feed`, `ats_scraper`        |
+| `employment_type` | string   | `FULLTIME`, `PARTTIME`, `CONTRACT`, `INTERN`                                                      |
+| `remote_only`     | bool     | Filter remote jobs only                                                                           |
+| `seniority`       | string[] | `junior`, `mid`, `senior`, `staff`, `principal`                                                   |
+| `category`        | string[] | `backend`, `frontend`, `fullstack`, `devops`, `data`, `ml`, `mobile`, `security`, `qa`, `general` |
 
 **Response:**
 
@@ -306,15 +306,15 @@ Visit `http://localhost:8000/docs` for Swagger UI.
 
 ### Components
 
-| Directory | Purpose |
-|-----------|---------|
-| `src/agents/` | 6 fetcher agents — each pulls raw jobs from an external source |
-| `src/enrichment/` | AI pipeline — Gemini processes raw data into 40-field schema |
-| `src/services/` | Ingestion orchestration, company discovery, scheduling |
-| `src/api/` | FastAPI routes, Pydantic schemas |
-| `src/database/` | SQLAlchemy models, CRUD operations, full-text search |
-| `src/utils/` | Config, logging |
-| `scripts/` | Migration & utility scripts |
+| Directory         | Purpose                                                        |
+| ----------------- | -------------------------------------------------------------- |
+| `src/agents/`     | 6 fetcher agents — each pulls raw jobs from an external source |
+| `src/enrichment/` | AI pipeline — Gemini processes raw data into 40-field schema   |
+| `src/services/`   | Ingestion orchestration, company discovery, scheduling         |
+| `src/api/`        | FastAPI routes, Pydantic schemas                               |
+| `src/database/`   | SQLAlchemy models, CRUD operations, full-text search           |
+| `src/utils/`      | Config, logging                                                |
+| `scripts/`        | Migration & utility scripts                                    |
 
 ### AI Pipeline Flow
 
@@ -337,18 +337,18 @@ Raw API data → Gemini 2.5 Flash-Lite (JSON mode, temperature=0)
 
 Each job has **41 API fields** (42 DB columns including internal `search_vector`):
 
-| Group | Fields |
-|-------|--------|
-| **Identity** | `id`, `source`, `source_id`, `source_url` |
-| **Core** | `title`, `company`, `company_logo`, `company_website`, `description`, `short_description` |
-| **Location** | `location`, `country`, `city`, `state`, `is_remote`, `work_arrangement`, `latitude`, `longitude` |
-| **Employment** | `employment_type`, `seniority_level`, `department`, `category` |
-| **Compensation** | `salary_min`, `salary_max`, `salary_currency`, `salary_period` |
-| **Skills** | `skills`, `required_experience_years`, `required_education`, `key_responsibilities`, `nice_to_have_skills` |
-| **Benefits** | `benefits`, `visa_sponsorship` |
-| **Dates** | `posted_at`, `application_deadline`, `fetched_at` |
-| **Apply** | `apply_url`, `apply_options` |
-| **Meta** | `tags`, `quality_score` |
+| Group            | Fields                                                                                                     |
+| ---------------- | ---------------------------------------------------------------------------------------------------------- |
+| **Identity**     | `id`, `source`, `source_id`, `source_url`                                                                  |
+| **Core**         | `title`, `company`, `company_logo`, `company_website`, `description`, `short_description`                  |
+| **Location**     | `location`, `country`, `city`, `state`, `is_remote`, `work_arrangement`, `latitude`, `longitude`           |
+| **Employment**   | `employment_type`, `seniority_level`, `department`, `category`                                             |
+| **Compensation** | `salary_min`, `salary_max`, `salary_currency`, `salary_period`                                             |
+| **Skills**       | `skills`, `required_experience_years`, `required_education`, `key_responsibilities`, `nice_to_have_skills` |
+| **Benefits**     | `benefits`, `visa_sponsorship`                                                                             |
+| **Dates**        | `posted_at`, `application_deadline`, `fetched_at`                                                          |
+| **Apply**        | `apply_url`, `apply_options`                                                                               |
+| **Meta**         | `tags`, `quality_score`                                                                                    |
 
 ### Database Indexes
 
@@ -440,13 +440,13 @@ That's it — the enrichment pipeline and DB layer handle everything else.
 
 ### Common Issues
 
-| Problem | Solution |
-|---------|----------|
+| Problem                                      | Solution                                                  |
+| -------------------------------------------- | --------------------------------------------------------- |
 | `asyncpg.exceptions.InvalidCatalogNameError` | `docker-compose down -v && docker-compose up -d postgres` |
-| `ssl.SSLCertVerificationError` | Add `ssl_no_verify=true` to DATABASE_URL |
-| `429 Too Many Requests` | Increase `INGESTION_INTERVAL_MINUTES` in `.env` |
-| `FutureWarning: google.generativeai` | Non-blocking — migration to `google.genai` planned |
-| Server returns `500` on search | Check for malformed `location` data in DB |
+| `ssl.SSLCertVerificationError`               | Add `ssl_no_verify=true` to DATABASE_URL                  |
+| `429 Too Many Requests`                      | Increase `INGESTION_INTERVAL_MINUTES` in `.env`           |
+| `FutureWarning: google.generativeai`         | Non-blocking — migration to `google.genai` planned        |
+| Server returns `500` on search               | Check for malformed `location` data in DB                 |
 
 ### Test a Single Source
 

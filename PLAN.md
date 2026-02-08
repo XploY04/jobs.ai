@@ -1,0 +1,7 @@
+- MCP server
+- Cron jobs for regular fetching
+- Redis caching for speed
+- orchestrator agent
+- Kubernetes deployment
+- Prometheus/Grafana monitoring
+- Regional job fetching

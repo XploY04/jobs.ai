@@ -5,3 +5,5 @@
 - Kubernetes deployment
 - Prometheus/Grafana monitoring
 - Regional job fetching
+- Resume parsing and matching
+- ip detection and job filtering   based on location

@@ -14,7 +14,7 @@ class AdzunaFetcher(BaseFetcher):
     """Fetcher for Adzuna API."""
 
     BASE_URL_TEMPLATE = "https://api.adzuna.com/v1/api/jobs/{country}/search/{page}"
-    COUNTRIES = ["us", "gb", "ca", "au", "de", "fr", "nl"]
+    COUNTRIES = ["us", "gb", "in"]
     CATEGORY = "it-jobs"
     MAX_PAGES = 20  # 20 pages × 100 results = 2000 jobs per country
 

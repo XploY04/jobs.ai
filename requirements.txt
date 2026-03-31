@@ -23,6 +23,7 @@ pyyaml==6.0.3
 
 # AI
 google-generativeai==0.8.6
+openai==1.82.0
 
 # Testing
 pytest==9.0.2

@@ -1,21 +1,20 @@
-"""Gemini AI processor — the ONLY data transformation layer.
+"""AI processor — the ONLY data transformation layer.
 
 Takes raw API data from any source and outputs the final structured job schema.
-No normalizer needed. Gemini handles schema mapping for ALL sources.
+No normalizer needed. The AI handles schema mapping for ALL sources.
+
+Supports Gemini and OpenAI. Uses whichever API key is available in env
+(GEMINI_API_KEY or OPENAI_API_KEY). Gemini is preferred if both are set.
 
 Optimizations:
-  - Model: gemini-2.5-flash-lite (cheapest, built for bulk)
-  - Thinking OFF: thinkingBudget=0 (extraction, not reasoning — saves output tokens)
-  - JSON mode: response_mime_type="application/json" (guarantees valid JSON, no markdown)
-  - System instruction: schema + rules sent ONCE per model instance, not repeated every call
   - Batch processing: 5 jobs per API call (80% fewer calls)
-  - temperature=0: deterministic extraction, no creativity
+  - JSON mode: guarantees valid JSON output
+  - temperature=0: deterministic extraction
+  - System instruction sent once, not repeated every call
 """
 
 import json
 from typing import Dict, Any, Optional, List
-import google.generativeai as genai
-from google.generativeai.types import GenerationConfig
 from src.utils.config import settings
 from src.utils.logger import setup_logger
 
@@ -80,38 +79,53 @@ EXTRACTION RULES:
 
 
 class AIProcessor:
-    """Use Gemini AI to transform raw job data into structured schema.
+    """AI processor supporting Gemini and OpenAI.
 
-    Optimized for bulk extraction:
-      - system_instruction avoids repeating schema/rules in every prompt
-      - response_mime_type="application/json" guarantees valid JSON
-      - thinkingBudget=0 disables reasoning (pure extraction, saves tokens)
-      - temperature=0 for deterministic output
+    Uses whichever API key is available. Gemini is preferred if both are set.
     """
 
     def __init__(self):
+        self.provider = None
+        self._gemini_model = None
+        self._openai_client = None
+
         if settings.gemini_api_key:
-            genai.configure(api_key=settings.gemini_api_key)
-            self.model = genai.GenerativeModel(
-                model_name='gemini-2.5-flash-lite',
-                system_instruction=SYSTEM_INSTRUCTION,
-                generation_config=GenerationConfig(
-                    response_mime_type="application/json",
-                    temperature=0,
-                ),
-            )
-            self.enabled = True
-            logger.info("Gemini AI processor initialized (model: gemini-2.5-flash-lite, JSON mode, thinking OFF)")
+            self._init_gemini()
+        elif settings.openai_api_key:
+            self._init_openai()
         else:
-            self.enabled = False
-            logger.warning("Gemini API key not set - AI processing disabled")
+            logger.warning("No AI API key set (GEMINI_API_KEY or OPENAI_API_KEY) - AI processing disabled")
+
+        self.enabled = self.provider is not None
+
+    def _init_gemini(self):
+        import google.generativeai as genai
+        from google.generativeai.types import GenerationConfig
+
+        genai.configure(api_key=settings.gemini_api_key)
+        self._gemini_model = genai.GenerativeModel(
+            model_name='gemini-2.5-flash-lite',
+            system_instruction=SYSTEM_INSTRUCTION,
+            generation_config=GenerationConfig(
+                response_mime_type="application/json",
+                temperature=0,
+            ),
+        )
+        self.provider = "gemini"
+        logger.info("AI processor initialized (provider: Gemini, model: gemini-2.5-flash-lite)")
+
+    def _init_openai(self):
+        from openai import OpenAI
+
+        self._openai_client = OpenAI(api_key=settings.openai_api_key)
+        self.provider = "openai"
+        logger.info("AI processor initialized (provider: OpenAI, model: gpt-4o-mini)")
 
     # ------------------------------------------------------------------
     # Single job processing (fallback for failed batch items)
     # ------------------------------------------------------------------
 
     def process_raw_job(self, source: str, raw_job: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Transform a single raw job into structured schema. Used as fallback."""
         if not self.enabled:
             return None
 
@@ -119,7 +133,7 @@ class AIProcessor:
             raw_str = json.dumps(raw_job, default=str, ensure_ascii=False)
             prompt = f'Extract this job from source "{source}" into the schema. Return a single JSON object.\n\n{raw_str}'
 
-            result = self._call_gemini(prompt)
+            result = self._call_ai(prompt)
             if isinstance(result, list):
                 result = result[0] if result else None
             if result:
@@ -136,12 +150,6 @@ class AIProcessor:
 
     def process_batch(self, source: str, raw_jobs: List[Dict[str, Any]],
                       batch_size: int = BATCH_SIZE) -> List[Optional[Dict[str, Any]]]:
-        """
-        Process multiple raw jobs in batched Gemini API calls.
-
-        Returns a list the SAME LENGTH as raw_jobs. Each element is either
-        the extracted dict or None (if that job failed).
-        """
         if not self.enabled:
             return [None] * len(raw_jobs)
 
@@ -155,7 +163,6 @@ class AIProcessor:
         return all_results
 
     def _process_chunk(self, source: str, chunk: List[Dict[str, Any]]) -> List[Optional[Dict[str, Any]]]:
-        """Send a chunk of jobs to Gemini in ONE API call, return matched results."""
         n = len(chunk)
 
         try:
@@ -165,10 +172,9 @@ class AIProcessor:
                 jobs_block.append(f"=== JOB {idx + 1} of {n} ===\n{raw_str}")
 
             joined = "\n\n".join(jobs_block)
-
             prompt = f'Extract {n} jobs from source "{source}". Return a JSON array with exactly {n} objects in the same order.\n\n{joined}'
 
-            result = self._call_gemini(prompt)
+            result = self._call_ai(prompt)
 
             if isinstance(result, list) and len(result) == n:
                 logger.info(f"[{source}] Batch OK: {n} jobs in 1 API call")
@@ -188,18 +194,30 @@ class AIProcessor:
             return self._fallback_to_single(source, chunk)
 
     def _fallback_to_single(self, source: str, chunk: List[Dict[str, Any]]) -> List[Optional[Dict[str, Any]]]:
-        """When a batch fails, retry each job individually."""
         return [self.process_raw_job(source, raw_job) for raw_job in chunk]
 
     # ------------------------------------------------------------------
-    # Helpers
+    # Provider dispatch
     # ------------------------------------------------------------------
 
-    def _call_gemini(self, prompt: str) -> Any:
-        """Call Gemini and parse the JSON response.
+    def _call_ai(self, prompt: str) -> Any:
+        if self.provider == "gemini":
+            return self._call_gemini(prompt)
+        elif self.provider == "openai":
+            return self._call_openai(prompt)
 
-        With response_mime_type="application/json", Gemini guarantees valid JSON —
-        no need to strip markdown code blocks.
-        """
-        response = self.model.generate_content(prompt)
+    def _call_gemini(self, prompt: str) -> Any:
+        response = self._gemini_model.generate_content(prompt)
         return json.loads(response.text)
+
+    def _call_openai(self, prompt: str) -> Any:
+        response = self._openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": SYSTEM_INSTRUCTION},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        return json.loads(response.choices[0].message.content)

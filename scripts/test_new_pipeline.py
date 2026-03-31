@@ -1,4 +1,4 @@
-"""Quick test of the new pipeline (no normalizer, raw → structured)."""
+"""Quick test of the new pipeline (no normalizer, raw -> structured)."""
 import sys, asyncio, json
 sys.path.insert(0, '.')
 
@@ -34,7 +34,7 @@ async def test():
     # Test DB save
     print("\n--- Testing DB save ---")
     await db.connect()
-    
+
     # Use just 3 jobs to test
     test_jobs = processed[:3]
     # Give them unique IDs to avoid dedup
@@ -42,30 +42,29 @@ async def test():
         job["source_id"] = f"test_v2_{i}"
         job["id"] = f"remoteok_test_v2_{i}"
         job["title_company_hash"] = f"test_v2_hash_{i}"
-    
+
     stats = await db.save_jobs(test_jobs)
     print(f"  DB save result: {stats}")
-    
+
     # Read back and verify
-    from sqlalchemy import text
-    async with db.session_maker() as sess:
-        result = await sess.execute(text(
-            "SELECT id, title, company, category, seniority_level, is_remote, "
-            "work_arrangement, quality_score, tags, skills, salary_period, company_logo "
-            "FROM jobs WHERE id LIKE 'remoteok_test_v2_%' LIMIT 3"
-        ))
-        rows = result.fetchall()
-        print(f"  Read back {len(rows)} jobs from DB:")
-        for row in rows:
-            print(f"    {row[0]}: title={row[1]}, category={row[3]}, seniority={row[4]}, "
-                  f"remote={row[5]}, work={row[6]}, quality={row[7]}, tags={row[8]}")
-    
+    cursor = db.jobs.find(
+        {"_id": {"$regex": "^remoteok_test_v2_"}},
+        {"title": 1, "company": 1, "category": 1, "seniority_level": 1,
+         "is_remote": 1, "work_arrangement": 1, "quality_score": 1,
+         "tags": 1, "skills": 1, "salary_period": 1, "company_logo": 1},
+    )
+    rows = await cursor.to_list(length=3)
+    print(f"  Read back {len(rows)} jobs from DB:")
+    for r in rows:
+        print(f"    {r['_id']}: title={r.get('title')}, category={r.get('category')}, "
+              f"seniority={r.get('seniority_level')}, remote={r.get('is_remote')}, "
+              f"work={r.get('work_arrangement')}, quality={r.get('quality_score')}, "
+              f"tags={r.get('tags')}")
+
     # Clean up test data
-    async with db.session_maker() as sess:
-        await sess.execute(text("DELETE FROM jobs WHERE id LIKE 'remoteok_test_v2_%'"))
-        await sess.commit()
-        print("  Cleaned up test data")
-    
+    result = await db.jobs.delete_many({"_id": {"$regex": "^remoteok_test_v2_"}})
+    print(f"  Cleaned up {result.deleted_count} test documents")
+
     await db.disconnect()
     print("\nAll tests passed.")
 

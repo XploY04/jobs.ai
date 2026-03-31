@@ -15,13 +15,14 @@ def create_app() -> FastAPI:
 
     app = FastAPI(title="Backend & DevOps Jobs API", version="0.1.0")
 
-    if settings.environment != "production":
-        app.add_middleware(
-            CORSMiddleware,
-            allow_origins=["*"],
-            allow_methods=["*"],
-            allow_headers=["*"],
-        )
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"] if settings.environment != "production" else [
+            os.getenv("FRONTEND_URL", "https://jobs-ai.vercel.app"),
+        ],
+        allow_methods=["GET", "POST"],
+        allow_headers=["*"],
+    )
 
     @app.on_event("startup")
     async def startup_event() -> None:

@@ -37,7 +37,7 @@ def main() -> None:
     uvicorn.run(
         "src.api.main:app",
         host="0.0.0.0",
-        port=settings.api_port,
+        port=settings.port or settings.api_port,
         reload=settings.environment != "production",
     )
 

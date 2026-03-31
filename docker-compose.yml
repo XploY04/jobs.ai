@@ -1,38 +1,20 @@
 services:
-  postgres:
-    image: postgres:16
-    platform: linux/amd64
-    container_name: jobs_db
-    environment:
-      POSTGRES_DB: jobs_db
-      POSTGRES_USER: jobuser
-      POSTGRES_PASSWORD: jobpass123
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U jobuser"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
+  # Full stack — single process for simple deployments
   app:
     build: .
     platform: linux/amd64
-    container_name: jobs_aggregator
-    environment:
-      - DATABASE_URL=postgresql://jobuser:jobpass123@postgres:5432/jobs_db
+    container_name: jobs_app
+    ports:
+      - "8000:8000"
     env_file:
       - .env
-    depends_on:
-      postgres:
-        condition: service_healthy
+    environment:
+      - ENVIRONMENT=production
     restart: unless-stopped
     volumes:
       - ./logs:/app/logs
 
+  # API-only — for scaling API independently
   api:
     build: .
     platform: linux/amd64
@@ -40,16 +22,28 @@ services:
     command: uvicorn src.api.main:app --host 0.0.0.0 --port 8000
     ports:
       - "8000:8000"
-    environment:
-      - DATABASE_URL=postgresql://jobuser:jobpass123@postgres:5432/jobs_db
     env_file:
       - .env
-    depends_on:
-      postgres:
-        condition: service_healthy
+    environment:
+      - ENVIRONMENT=production
     restart: unless-stopped
     volumes:
       - ./logs:/app/logs
+    profiles:
+      - api-only
 
-volumes:
-  postgres_data:
+  # Worker-only (one-shot ingestion)
+  worker:
+    build: .
+    platform: linux/amd64
+    container_name: jobs_worker
+    command: python -m src.main --ingest-once
+    env_file:
+      - .env
+    environment:
+      - ENVIRONMENT=production
+    restart: "no"
+    volumes:
+      - ./logs:/app/logs
+    profiles:
+      - worker-only

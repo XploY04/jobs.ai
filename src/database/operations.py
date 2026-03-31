@@ -1,13 +1,15 @@
+"""MongoDB database operations using Motor (async driver)."""
+
 import hashlib
-import ssl
+import re
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import select, func, or_, Boolean, text
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.engine.url import make_url
+from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
+from pymongo import DESCENDING
+from pymongo.uri_parser import parse_uri
 
-from src.database.models import Base, Job
+from src.database.models import ensure_indexes, normalize_doc
 from src.utils.config import settings
 from src.utils.logger import setup_logger
 
@@ -15,155 +17,115 @@ logger = setup_logger(__name__)
 
 
 class Database:
-    """Database helper for connections and CRUD operations."""
+    """MongoDB database helper for connections and CRUD operations."""
 
     def __init__(self) -> None:
-        self.engine = None
-        self.session_maker: sessionmaker[AsyncSession] | None = None
+        self.client: AsyncIOMotorClient | None = None
+        self.db: AsyncIOMotorDatabase | None = None
+
+    @property
+    def jobs(self):
+        return self.db["jobs"]
+
+    @property
+    def companies(self):
+        return self.db["discovered_companies"]
 
     async def connect(self) -> None:
-        """Initialize database connection and ensure tables exist."""
+        """Initialize MongoDB connection and ensure indexes exist."""
 
-        connect_args = {}
-        raw_url = settings.database_url
-        url = make_url(raw_url)
+        uri = settings.database_url
+        self.client = AsyncIOMotorClient(uri)
 
-        driver = url.drivername
-        if driver in {"postgres", "postgresql"}:
-            driver = "postgresql+asyncpg"
+        parsed = parse_uri(uri)
+        db_name = parsed.get("database") or "jobs_db"
+        self.db = self.client[db_name]
 
-        query = dict(url.query)
-        sslmode = query.pop("sslmode", None)
-        sslrootcert = query.pop("sslrootcert", None)
-        ssl_no_verify = query.pop("ssl_no_verify", None)
-
-        if sslmode:
-            sslmode = sslmode.lower()
-
-        if ssl_no_verify:
-            ssl_no_verify = ssl_no_verify.lower() in {"1", "true", "yes"}
-
-        if sslmode == "disable":
-            connect_args["ssl"] = False
-        elif sslmode in {"require", "verify-ca", "verify-full"}:
-            if ssl_no_verify:
-                context = ssl._create_unverified_context()
-            else:
-                context = ssl.create_default_context(cafile=sslrootcert) if sslrootcert else ssl.create_default_context()
-                context.check_hostname = sslmode == "verify-full"
-            connect_args["ssl"] = context
-
-        async_url = url.set(drivername=driver, query=query)
-        self.engine = create_async_engine(
-            async_url.render_as_string(hide_password=False),
-            echo=False,
-            connect_args=connect_args,
-        )
-        self.session_maker = sessionmaker(self.engine, class_=AsyncSession, expire_on_commit=False)
-
-        async with self.engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-
-        logger.info("Database connected and tables ensured")
+        await self.client.admin.command("ping")
+        await ensure_indexes(self.db)
+        logger.info("MongoDB connected (database: %s)", db_name)
 
     async def disconnect(self) -> None:
-        """Cleanly close database connections."""
+        """Close MongoDB connection."""
 
-        if self.engine:
-            await self.engine.dispose()
-            logger.info("Database disconnected")
+        if self.client:
+            self.client.close()
+            logger.info("MongoDB disconnected")
 
     async def save_jobs(self, jobs: List[Dict[str, Any]]) -> Dict[str, int]:
         """Insert jobs while skipping duplicates."""
 
         stats = {"new": 0, "skipped": 0}
 
-        if not self.session_maker:
-            raise RuntimeError("Database session maker not initialized")
+        if not self.db:
+            raise RuntimeError("Database not connected")
 
-        async with self.session_maker() as session:
-            for job_data in jobs:
-                try:
-                    job_id = job_data.get('id') or f"{job_data['source']}_{job_data['source_id']}"
-                    title_company_hash = job_data.get('title_company_hash') or self._hash_title_company(
-                        job_data.get('title', ''), job_data.get('company', '')
-                    )
+        for job_data in jobs:
+            try:
+                job_id = job_data.get("id") or f"{job_data['source']}_{job_data['source_id']}"
+                title_company_hash = job_data.get("title_company_hash") or self._hash_title_company(
+                    job_data.get("title", ""), job_data.get("company", "")
+                )
 
-                    exists = await session.get(Job, job_id)
-                    if exists:
-                        stats["skipped"] += 1
-                        continue
-
-                    # Check for duplicate title + company
-                    duplicate_stmt = select(Job.id).where(Job.title_company_hash == title_company_hash)
-                    duplicate = await session.execute(duplicate_stmt)
-                    if duplicate.scalar():
-                        stats["skipped"] += 1
-                        continue
-
-                    job = Job(
-                        # ── Identity ──
-                        id=job_id,
-                        source=job_data.get('source', ''),
-                        source_id=str(job_data.get('source_id', '')),
-                        source_url=job_data.get('source_url'),
-                        # ── Core Job Info ──
-                        title=job_data.get('title', ''),
-                        company=job_data.get('company', 'Unknown'),
-                        company_logo=job_data.get('company_logo'),
-                        company_website=job_data.get('company_website'),
-                        description=job_data.get('description', ''),
-                        short_description=job_data.get('short_description'),
-                        # ── Location ──
-                        location=job_data.get('location'),
-                        country=job_data.get('country'),
-                        city=job_data.get('city'),
-                        state=job_data.get('state'),
-                        is_remote=job_data.get('is_remote'),
-                        work_arrangement=job_data.get('work_arrangement'),
-                        latitude=job_data.get('latitude'),
-                        longitude=job_data.get('longitude'),
-                        # ── Employment Details ──
-                        employment_type=job_data.get('employment_type'),
-                        seniority_level=job_data.get('seniority_level'),
-                        department=job_data.get('department'),
-                        category=job_data.get('category'),
-                        # ── Compensation ──
-                        salary_min=self._to_str(job_data.get('salary_min')),
-                        salary_max=self._to_str(job_data.get('salary_max')),
-                        salary_currency=job_data.get('salary_currency'),
-                        salary_period=job_data.get('salary_period'),
-                        # ── Skills & Requirements ──
-                        skills=job_data.get('skills'),
-                        required_experience_years=job_data.get('required_experience_years'),
-                        required_education=job_data.get('required_education'),
-                        key_responsibilities=job_data.get('key_responsibilities'),
-                        nice_to_have_skills=job_data.get('nice_to_have_skills'),
-                        # ── Benefits & Perks ──
-                        benefits=job_data.get('benefits'),
-                        visa_sponsorship=job_data.get('visa_sponsorship'),
-                        # ── Dates ──
-                        posted_at=job_data.get('posted_at'),
-                        application_deadline=job_data.get('application_deadline'),
-                        # ── Apply ──
-                        apply_url=job_data.get('apply_url', ''),
-                        apply_options=job_data.get('apply_options'),
-                        # ── Quality / Meta ──
-                        tags=job_data.get('tags'),
-                        quality_score=job_data.get('quality_score'),
-                        raw_data=job_data.get('raw_data'),
-                        title_company_hash=title_company_hash,
-                    )
-
-                    session.add(job)
-                    stats["new"] += 1
-
-                except Exception as exc:  # pylint: disable=broad-except
-                    logger.error("Error saving job: %s", exc, exc_info=True)
-                    await session.rollback()
+                if await self.jobs.find_one({"_id": job_id}):
                     stats["skipped"] += 1
+                    continue
 
-            await session.commit()
+                if await self.jobs.find_one({"title_company_hash": title_company_hash}):
+                    stats["skipped"] += 1
+                    continue
+
+                doc = {
+                    "_id": job_id,
+                    "source": job_data.get("source", ""),
+                    "source_id": str(job_data.get("source_id", "")),
+                    "source_url": job_data.get("source_url"),
+                    "title": job_data.get("title", ""),
+                    "company": job_data.get("company", "Unknown"),
+                    "company_logo": job_data.get("company_logo"),
+                    "company_website": job_data.get("company_website"),
+                    "description": job_data.get("description", ""),
+                    "short_description": job_data.get("short_description"),
+                    "location": job_data.get("location"),
+                    "country": job_data.get("country"),
+                    "city": job_data.get("city"),
+                    "state": job_data.get("state"),
+                    "is_remote": job_data.get("is_remote"),
+                    "work_arrangement": job_data.get("work_arrangement"),
+                    "latitude": job_data.get("latitude"),
+                    "longitude": job_data.get("longitude"),
+                    "employment_type": job_data.get("employment_type"),
+                    "seniority_level": job_data.get("seniority_level"),
+                    "department": job_data.get("department"),
+                    "category": job_data.get("category"),
+                    "salary_min": self._to_str(job_data.get("salary_min")),
+                    "salary_max": self._to_str(job_data.get("salary_max")),
+                    "salary_currency": job_data.get("salary_currency"),
+                    "salary_period": job_data.get("salary_period"),
+                    "skills": job_data.get("skills"),
+                    "required_experience_years": job_data.get("required_experience_years"),
+                    "required_education": job_data.get("required_education"),
+                    "key_responsibilities": job_data.get("key_responsibilities"),
+                    "nice_to_have_skills": job_data.get("nice_to_have_skills"),
+                    "benefits": job_data.get("benefits"),
+                    "visa_sponsorship": job_data.get("visa_sponsorship"),
+                    "posted_at": job_data.get("posted_at"),
+                    "application_deadline": job_data.get("application_deadline"),
+                    "fetched_at": datetime.now(timezone.utc),
+                    "apply_url": job_data.get("apply_url", ""),
+                    "apply_options": job_data.get("apply_options"),
+                    "tags": job_data.get("tags"),
+                    "quality_score": job_data.get("quality_score"),
+                    "raw_data": job_data.get("raw_data"),
+                    "title_company_hash": title_company_hash,
+                }
+
+                await self.jobs.insert_one(doc)
+                stats["new"] += 1
+
+            except Exception as exc:
+                logger.error("Error saving job: %s", exc, exc_info=True)
+                stats["skipped"] += 1
 
         return stats
 
@@ -180,20 +142,43 @@ class Database:
             return value
         return str(value)
 
-    @staticmethod
-    def _build_tsquery(search: str) -> str:
-        """Convert user search string into a PostgreSQL tsquery.
+    def _build_filter(
+        self,
+        *,
+        search: Optional[str] = None,
+        sources: Optional[List[str]] = None,
+        employment_type: Optional[str] = None,
+        remote_only: bool = False,
+        seniority: Optional[List[str]] = None,
+        category: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Build a MongoDB filter dict from query parameters."""
 
-        - Splits on whitespace
-        - Strips non-alphanumeric chars
-        - Joins with '&' (AND) so all terms must match
-        - Appends ':*' for prefix matching ("pyth" matches "python")
-        """
-        import re
-        words = re.findall(r'[\w]+', search.strip())
-        if not words:
-            return ''
-        return ' & '.join(f"{w}:*" for w in words)
+        query: Dict[str, Any] = {}
+
+        if search:
+            query["$text"] = {"$search": search}
+
+        if sources:
+            query["source"] = {"$in": sources}
+
+        if employment_type:
+            query["employment_type"] = re.compile(f"^{re.escape(employment_type)}$", re.IGNORECASE)
+
+        if remote_only:
+            query["is_remote"] = True
+
+        if seniority:
+            query["seniority_level"] = {
+                "$in": [re.compile(f"^{re.escape(s)}$", re.IGNORECASE) for s in seniority]
+            }
+
+        if category:
+            query["category"] = {
+                "$in": [re.compile(f"^{re.escape(c)}$", re.IGNORECASE) for c in category]
+            }
+
+        return query
 
     async def count_jobs(
         self,
@@ -207,35 +192,14 @@ class Database:
     ) -> int:
         """Count total jobs matching the filters."""
 
-        if not self.session_maker:
-            raise RuntimeError("Database session maker not initialized")
+        if not self.db:
+            raise RuntimeError("Database not connected")
 
-        stmt = select(func.count(Job.id))
-
-        if search:
-            tsquery = self._build_tsquery(search)
-            stmt = stmt.where(Job.search_vector.op('@@')(func.to_tsquery('english', tsquery)))
-
-        if sources:
-            stmt = stmt.where(Job.source.in_(sources))
-
-        if employment_type:
-            stmt = stmt.where(func.lower(Job.employment_type) == employment_type.lower())
-
-        if remote_only:
-            stmt = stmt.where(Job.is_remote == True)
-
-        if seniority:
-            seniority_lower = [s.lower() for s in seniority]
-            stmt = stmt.where(func.lower(Job.seniority_level).in_(seniority_lower))
-
-        if category:
-            category_lower = [c.lower() for c in category]
-            stmt = stmt.where(func.lower(Job.category).in_(category_lower))
-
-        async with self.session_maker() as session:
-            result = await session.execute(stmt)
-            return result.scalar() or 0
+        query = self._build_filter(
+            search=search, sources=sources, employment_type=employment_type,
+            remote_only=remote_only, seniority=seniority, category=category,
+        )
+        return await self.jobs.count_documents(query)
 
     async def list_jobs(
         self,
@@ -248,114 +212,106 @@ class Database:
         remote_only: bool = False,
         seniority: Optional[List[str]] = None,
         category: Optional[List[str]] = None,
-    ) -> List[Job]:
-        """Return paginated jobs with lightweight filtering."""
+    ) -> List[Dict[str, Any]]:
+        """Return paginated jobs with filtering and full-text search."""
 
-        if not self.session_maker:
-            raise RuntimeError("Database session maker not initialized")
+        if not self.db:
+            raise RuntimeError("Database not connected")
 
         limit = max(1, min(limit, 200))
         offset = max(0, offset)
 
+        query = self._build_filter(
+            search=search, sources=sources, employment_type=employment_type,
+            remote_only=remote_only, seniority=seniority, category=category,
+        )
+
+        projection = {"raw_data": 0}
+
         if search:
-            tsquery = self._build_tsquery(search)
-            ts_expr = func.to_tsquery('english', tsquery)
-            rank = func.ts_rank_cd(Job.search_vector, ts_expr)
-            stmt = select(Job).where(
-                Job.search_vector.op('@@')(ts_expr)
-            ).order_by(rank.desc(), Job.posted_at.desc())
+            projection["score"] = {"$meta": "textScore"}
+            sort = [("score", {"$meta": "textScore"}), ("posted_at", DESCENDING)]
         else:
-            stmt = select(Job).order_by(Job.posted_at.desc())
+            sort = [("posted_at", DESCENDING)]
 
-        if sources:
-            stmt = stmt.where(Job.source.in_(sources))
+        cursor = self.jobs.find(query, projection).sort(sort).skip(offset).limit(limit)
+        docs = await cursor.to_list(length=limit)
 
-        if employment_type:
-            stmt = stmt.where(func.lower(Job.employment_type) == employment_type.lower())
+        for doc in docs:
+            normalize_doc(doc)
+            doc.pop("score", None)
 
-        if remote_only:
-            stmt = stmt.where(Job.is_remote == True)
+        return docs
 
-        if seniority:
-            seniority_lower = [s.lower() for s in seniority]
-            stmt = stmt.where(func.lower(Job.seniority_level).in_(seniority_lower))
-
-        if category:
-            category_lower = [c.lower() for c in category]
-            stmt = stmt.where(func.lower(Job.category).in_(category_lower))
-
-        stmt = stmt.offset(offset).limit(limit)
-
-        async with self.session_maker() as session:
-            result = await session.execute(stmt)
-            jobs = result.scalars().all()
-
-        return jobs
-
-    async def get_job(self, job_id: str) -> Optional[Job]:
+    async def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
         """Fetch a single job by identifier."""
 
-        if not self.session_maker:
-            raise RuntimeError("Database session maker not initialized")
+        if not self.db:
+            raise RuntimeError("Database not connected")
 
-        async with self.session_maker() as session:
-            return await session.get(Job, job_id)
+        doc = await self.jobs.find_one({"_id": job_id}, {"raw_data": 0})
+        return normalize_doc(doc)
 
     async def get_filter_options(self) -> Dict[str, Any]:
         """Get available filter options with job counts."""
 
-        if not self.session_maker:
-            raise RuntimeError("Database session maker not initialized")
+        if not self.db:
+            raise RuntimeError("Database not connected")
 
-        async with self.session_maker() as session:
-            # Get seniority options
-            seniority_result = await session.execute(
-                select(Job.seniority_level, func.count(Job.id))
-                .where(Job.seniority_level.isnot(None))
-                .group_by(Job.seniority_level)
-                .order_by(func.count(Job.id).desc())
-            )
-            seniority = [
-                {"value": row[0], "count": row[1]} 
-                for row in seniority_result.all()
-            ]
+        seniority_pipeline = [
+            {"$match": {"seniority_level": {"$ne": None}}},
+            {"$group": {"_id": "$seniority_level", "count": {"$sum": 1}}},
+            {"$sort": {"count": -1}},
+        ]
+        seniority = [
+            {"value": doc["_id"], "count": doc["count"]}
+            async for doc in self.jobs.aggregate(seniority_pipeline)
+        ]
 
-            # Get category options
-            category_result = await session.execute(
-                select(Job.category, func.count(Job.id))
-                .where(Job.category.isnot(None))
-                .group_by(Job.category)
-                .order_by(func.count(Job.id).desc())
-            )
-            categories = [
-                {"value": row[0], "count": row[1]} 
-                for row in category_result.all()
-            ]
+        category_pipeline = [
+            {"$match": {"category": {"$ne": None}}},
+            {"$group": {"_id": "$category", "count": {"$sum": 1}}},
+            {"$sort": {"count": -1}},
+        ]
+        categories = [
+            {"value": doc["_id"], "count": doc["count"]}
+            async for doc in self.jobs.aggregate(category_pipeline)
+        ]
 
-            # Get source options
-            source_result = await session.execute(
-                select(Job.source, func.count(Job.id))
-                .group_by(Job.source)
-                .order_by(func.count(Job.id).desc())
-            )
-            sources = [
-                {"value": row[0], "count": row[1]} 
-                for row in source_result.all()
-            ]
+        source_pipeline = [
+            {"$group": {"_id": "$source", "count": {"$sum": 1}}},
+            {"$sort": {"count": -1}},
+        ]
+        sources = [
+            {"value": doc["_id"], "count": doc["count"]}
+            async for doc in self.jobs.aggregate(source_pipeline)
+        ]
 
-            # Count remote jobs
-            remote_result = await session.execute(
-                select(func.count(Job.id))
-                .where(Job.is_remote == True)
-            )
-            remote_count = remote_result.scalar() or 0
+        remote_count = await self.jobs.count_documents({"is_remote": True})
 
-            return {
-                "seniority": seniority,
-                "category": categories,
-                "sources": sources,
-                "remote_count": remote_count,
-            }
+        return {
+            "seniority": seniority,
+            "category": categories,
+            "sources": sources,
+            "remote_count": remote_count,
+        }
+
+    async def cleanup_expired_jobs(self, default_expiry_days: int = 45) -> Dict[str, int]:
+        """Remove jobs past their application_deadline or older than default_expiry_days."""
+
+        if not self.db:
+            raise RuntimeError("Database not connected")
+
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(days=default_expiry_days)
+
+        condition = {"$or": [
+            {"application_deadline": {"$ne": None, "$lt": now}},
+            {"application_deadline": None, "posted_at": {"$lt": cutoff}},
+        ]}
+
+        result = await self.jobs.delete_many(condition)
+        return {"deleted": result.deleted_count}
 
 
 db = Database()

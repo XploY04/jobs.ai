@@ -1,7 +1,7 @@
 """
 Company Discovery Service — uses SerpAPI to discover company slugs
 on ATS platforms (Greenhouse, Lever, Ashby, Workable, SmartRecruiters)
-and stores them in the discovered_companies DB table.
+and stores them in the discovered_companies collection.
 
 Design:
   - Each run spends ≤30 SerpAPI queries (100/month free tier)
@@ -15,10 +15,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Set, Tuple
 
 import aiohttp
-from sqlalchemy import select
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from src.database.models import DiscoveredCompany
 from src.database.operations import db
 from src.utils.config import settings
 from src.utils.logger import setup_logger
@@ -153,7 +150,7 @@ QUERIES_PER_RUN = 10
 class CompanyDiscoveryService:
     """
     Discovers company slugs on ATS platforms using SerpAPI.
-    Stores results in discovered_companies DB table for the ATS scraper.
+    Stores results in discovered_companies collection for the ATS scraper.
     """
 
     SERPAPI_URL = "https://serpapi.com/search.json"
@@ -191,56 +188,36 @@ class CompanyDiscoveryService:
 
     async def get_companies_for_platform(self, platform: str) -> List[Dict[str, Any]]:
         """Return all active company slugs for a given ATS platform."""
-        if not db.session_maker:
+        if db.db is None:
             return []
-        async with db.session_maker() as session:
-            stmt = (
-                select(DiscoveredCompany)
-                .where(DiscoveredCompany.platform == platform)
-                .where(DiscoveredCompany.is_active == True)  # noqa: E712
-                .order_by(DiscoveredCompany.job_count.desc())
-            )
-            result = await session.execute(stmt)
-            rows = result.scalars().all()
-            return [
-                {"slug": r.slug, "company_name": r.company_name, "platform": r.platform}
-                for r in rows
-            ]
+        cursor = db.companies.find(
+            {"platform": platform, "is_active": True},
+        ).sort("job_count", -1)
+        rows = await cursor.to_list(length=None)
+        return [
+            {"slug": r["slug"], "company_name": r.get("company_name"), "platform": r["platform"]}
+            for r in rows
+        ]
 
     async def mark_company_fetched(
         self, platform: str, slug: str, job_count: int
     ) -> None:
         """Update last_fetched_at and job_count after scraping."""
-        if not db.session_maker:
+        if db.db is None:
             return
-        async with db.session_maker() as session:
-            stmt = (
-                select(DiscoveredCompany)
-                .where(DiscoveredCompany.platform == platform)
-                .where(DiscoveredCompany.slug == slug)
-            )
-            result = await session.execute(stmt)
-            company = result.scalar_one_or_none()
-            if company:
-                company.last_fetched_at = datetime.now(timezone.utc)
-                company.job_count = job_count
-                await session.commit()
+        await db.companies.update_one(
+            {"platform": platform, "slug": slug},
+            {"$set": {"last_fetched_at": datetime.now(timezone.utc), "job_count": job_count}},
+        )
 
     async def mark_company_inactive(self, platform: str, slug: str) -> None:
         """Mark a company as inactive (404, dead board)."""
-        if not db.session_maker:
+        if db.db is None:
             return
-        async with db.session_maker() as session:
-            stmt = (
-                select(DiscoveredCompany)
-                .where(DiscoveredCompany.platform == platform)
-                .where(DiscoveredCompany.slug == slug)
-            )
-            result = await session.execute(stmt)
-            company = result.scalar_one_or_none()
-            if company:
-                company.is_active = False
-                await session.commit()
+        await db.companies.update_one(
+            {"platform": platform, "slug": slug},
+            {"$set": {"is_active": False}},
+        )
 
     # ------------------------------------------------------------------
     # Seed known companies
@@ -248,30 +225,25 @@ class CompanyDiscoveryService:
 
     async def _seed_known_companies(self) -> int:
         """Insert seed companies into DB (upsert to avoid duplicates)."""
-        if not db.session_maker:
+        if db.db is None:
             return 0
 
         count = 0
-        async with db.session_maker() as session:
-            for platform, companies in SEED_COMPANIES.items():
-                for slug, name in companies:
-                    stmt = (
-                        pg_insert(DiscoveredCompany)
-                        .values(
-                            slug=slug,
-                            platform=platform,
-                            company_name=name,
-                            discovered_via="seed",
-                            is_active=True,
-                        )
-                        .on_conflict_do_nothing(
-                            index_elements=["platform", "slug"]
-                        )
-                    )
-                    result = await session.execute(stmt)
-                    if result.rowcount:
-                        count += 1
-            await session.commit()
+        for platform, companies in SEED_COMPANIES.items():
+            for slug, name in companies:
+                result = await db.companies.update_one(
+                    {"platform": platform, "slug": slug},
+                    {"$setOnInsert": {
+                        "company_name": name,
+                        "discovered_via": "seed",
+                        "is_active": True,
+                        "discovered_at": datetime.now(timezone.utc),
+                        "job_count": 0,
+                    }},
+                    upsert=True,
+                )
+                if result.upserted_id is not None:
+                    count += 1
         return count
 
     # ------------------------------------------------------------------
@@ -367,24 +339,21 @@ class CompanyDiscoveryService:
 
     async def _save_slug(self, platform: str, slug: str) -> bool:
         """Save a discovered slug to DB. Returns True if new."""
-        if not db.session_maker:
+        if db.db is None:
             return False
 
-        async with db.session_maker() as session:
-            stmt = (
-                pg_insert(DiscoveredCompany)
-                .values(
-                    slug=slug,
-                    platform=platform,
-                    company_name=slug.replace("-", " ").title(),
-                    discovered_via="serpapi",
-                    is_active=True,
-                )
-                .on_conflict_do_nothing(index_elements=["platform", "slug"])
-            )
-            result = await session.execute(stmt)
-            await session.commit()
-            return bool(result.rowcount)
+        result = await db.companies.update_one(
+            {"platform": platform, "slug": slug},
+            {"$setOnInsert": {
+                "company_name": slug.replace("-", " ").title(),
+                "discovered_via": "serpapi",
+                "is_active": True,
+                "discovered_at": datetime.now(timezone.utc),
+                "job_count": 0,
+            }},
+            upsert=True,
+        )
+        return result.upserted_id is not None
 
     # ------------------------------------------------------------------
     # Helpers
@@ -392,13 +361,6 @@ class CompanyDiscoveryService:
 
     async def _count_active_companies(self) -> int:
         """Count total active companies across all platforms."""
-        if not db.session_maker:
+        if db.db is None:
             return 0
-        async with db.session_maker() as session:
-            from sqlalchemy import func as sqlfunc
-
-            stmt = select(sqlfunc.count()).select_from(DiscoveredCompany).where(
-                DiscoveredCompany.is_active == True  # noqa: E712
-            )
-            result = await session.execute(stmt)
-            return result.scalar() or 0
+        return await db.companies.count_documents({"is_active": True})

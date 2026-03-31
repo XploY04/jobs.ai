@@ -1,0 +1,18 @@
+# Which sources run on which days.
+# Weekly sources: days are weekday numbers (0=Monday, 6=Sunday).
+# Monthly sources: days are day-of-month numbers.
+
+sources:
+  remoteok:
+    days: [0, 1, 2, 3, 4, 5, 6]   # daily (free, fast)
+  rss_feed:
+    days: [0, 1, 2, 3, 4, 5, 6]   # daily (free, fast)
+  jsearch:
+    days: [0, 2, 4]                # Mon, Wed, Fri (costs RapidAPI credits)
+  adzuna:
+    days: [1, 3, 5]                # Tue, Thu, Sat (has daily quotas)
+  hackernews:
+    days: [1, 15]                  # 1st and 15th of month (thread posts monthly)
+    type: monthly
+  ats_scraper:
+    days: [6]                      # Sunday only (company lists don't change often)

@@ -1,4 +1,4 @@
-"""Job ingestion orchestration and scheduling utilities."""
+"""Job ingestion orchestration."""
 
 from __future__ import annotations
 
@@ -6,32 +6,30 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
 
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
-from src.agents.adzuna import AdzunaFetcher
-from src.agents.jsearch import JSearchFetcher
-from src.agents.remoteok import RemoteOKFetcher
-from src.agents.hackernews import HackerNewsFetcher
-from src.agents.rss_feed import RSSFeedFetcher
-from src.agents.ats_scraper import ATSScraperFetcher
 from src.database.operations import db
 from src.enrichment.enrichment_pipeline import EnrichmentPipeline
+from src.services.orchestrator import get_todays_fetchers, FETCHER_MAP
 from src.utils.config import settings
 from src.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
-FETCHER_CLASSES = [RemoteOKFetcher, JSearchFetcher, AdzunaFetcher, HackerNewsFetcher, RSSFeedFetcher, ATSScraperFetcher]
+ALL_FETCHER_CLASSES = list(FETCHER_MAP.values())
 
 # Single pipeline: Raw → AI → Structured (no normalizer)
 pipeline = EnrichmentPipeline(use_ai=settings.enable_ai_enrichment)
 
 
-async def run_ingestion_cycle() -> Dict[str, Any]:
+async def run_ingestion_cycle(fetcher_classes: List | None = None) -> Dict[str, Any]:
     """Fetch raw → AI process → Save per batch. Each batch of ~5 jobs
-    hits the DB as soon as Gemini finishes processing it."""
+    hits the DB as soon as Gemini finishes processing it.
 
-    fetchers = [fetcher_cls() for fetcher_cls in FETCHER_CLASSES]
+    When fetcher_classes is None, the orchestrator picks today's scheduled sources.
+    Pass ALL_FETCHER_CLASSES explicitly to run everything."""
+
+    if fetcher_classes is None:
+        fetcher_classes = get_todays_fetchers()
+    fetchers = [cls() for cls in fetcher_classes]
     results = await asyncio.gather(*(_collect_jobs(fetcher) for fetcher in fetchers))
 
     # Thread-safe counters (only mutated inside async tasks, one event loop)
@@ -84,9 +82,13 @@ async def run_ingestion_cycle() -> Dict[str, Any]:
         *(_process_source(name, jobs) for name, jobs in results)
     )
 
+    cleanup_stats = await db.cleanup_expired_jobs()
+    logger.info("Cleanup: deleted %d expired jobs", cleanup_stats["deleted"])
+
     summary = {
         "sources": per_source,
         "db": {"new": total_new, "skipped": total_skipped},
+        "cleanup": cleanup_stats,
         "total_jobs": total_processed,
         "ran_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -104,39 +106,3 @@ async def _collect_jobs(fetcher) -> Tuple[str, List[Dict[str, Any]]]:
     except Exception as exc:  # pylint: disable=broad-except
         logger.error("[%s] Fetch failure: %s", fetcher.source_name, exc, exc_info=True)
         return fetcher.source_name, []
-
-
-class IngestionScheduler:
-    """APS-based scheduler that triggers ingestion cycles."""
-
-    def __init__(self, interval_minutes: int | None = None) -> None:
-        self.interval_minutes = interval_minutes or settings.ingestion_interval_minutes
-        self.scheduler = AsyncIOScheduler()
-        self.job_id = "job_ingestion_cycle"
-
-    def start(self) -> None:
-        if self.scheduler.running:
-            return
-
-        self.scheduler.add_job(
-            self._run_cycle,
-            "interval",
-            minutes=self.interval_minutes,
-            id=self.job_id,
-            max_instances=1,
-            replace_existing=True,
-            next_run_time=datetime.now(timezone.utc),
-        )
-        self.scheduler.start()
-        logger.info("Scheduler started with %s-minute interval", self.interval_minutes)
-
-    def stop(self) -> None:
-        if self.scheduler.running:
-            self.scheduler.shutdown(wait=False)
-            logger.info("Scheduler stopped")
-
-    async def _run_cycle(self) -> None:
-        await run_ingestion_cycle()
-
-    async def run_once(self) -> Dict[str, Any]:
-        return await run_ingestion_cycle()

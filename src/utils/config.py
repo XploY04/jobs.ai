@@ -21,7 +21,8 @@ class Settings(BaseSettings):
     # App settings
     environment: str = "development"
     log_level: str = "INFO"
-    api_port: int = 8000
+    port: int = 8000  # Railway/Render inject PORT
+    api_port: int = 8000  # Legacy alias
     ingestion_interval_minutes: int = 30
 
     class Config:

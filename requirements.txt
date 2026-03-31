@@ -4,8 +4,7 @@ pydantic==2.5.0
 pydantic-settings==2.1.0
 
 # Database
-asyncpg==0.29.0
-sqlalchemy==2.0.23
+motor==3.3.2
 
 # API
 fastapi==0.104.1
@@ -21,9 +20,6 @@ feedparser==6.0.11
 # Utilities
 python-dateutil==2.8.2
 pyyaml==6.0.1
-
-# Scheduling
-apscheduler==3.10.4
 
 # AI
 google-generativeai==0.3.2

@@ -1,105 +1,51 @@
-from sqlalchemy import Column, String, Text, DateTime, JSON, Index, Integer, ARRAY, Boolean, Float, Computed
-from sqlalchemy.dialects.postgresql import TSVECTOR
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.sql import func
+"""MongoDB index definitions and document helpers."""
 
-Base = declarative_base()
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
+
+from pymongo import ASCENDING, DESCENDING, TEXT
 
 
-class DiscoveredCompany(Base):
-    """Companies discovered via Google Custom Search for ATS scraping."""
-    __tablename__ = "discovered_companies"
+async def ensure_indexes(db) -> None:
+    """Create indexes on jobs and discovered_companies collections."""
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    slug = Column(String(200), nullable=False)
-    platform = Column(String(50), nullable=False)  # greenhouse, lever, ashby, workable, smartrecruiters
-    company_name = Column(String(255))  # human-readable name if known
-    discovered_via = Column(String(100))  # google_search, manual, etc.
-    discovered_at = Column(DateTime(timezone=True), server_default=func.now())
-    last_fetched_at = Column(DateTime(timezone=True))  # when we last scraped their jobs
-    is_active = Column(Boolean, default=True)  # set False if 404s consistently
-    job_count = Column(Integer, default=0)  # jobs found last fetch
-
-    __table_args__ = (
-        Index("idx_platform_slug", "platform", "slug", unique=True),
-        Index("idx_is_active", "is_active"),
+    jobs = db["jobs"]
+    await jobs.create_index(
+        [("source", ASCENDING), ("source_id", ASCENDING)],
+        unique=True,
+        name="idx_source_source_id",
     )
-
-
-class Job(Base):
-    __tablename__ = "jobs"
-
-    # ── Identity ──
-    id = Column(String(100), primary_key=True)  # e.g., "jsearch_abc123"
-    source = Column(String(50), nullable=False, index=True)
-    source_id = Column(String(200), nullable=False)
-    source_url = Column(String(1000))  # link back to source listing
-
-    # ── Core Job Info ──
-    title = Column(String(500), nullable=False, index=True)
-    company = Column(String(255), nullable=False, index=True)
-    company_logo = Column(String(1000))  # logo URL
-    company_website = Column(String(1000))  # employer website
-    description = Column(Text, nullable=False)  # full description (HTML preserved)
-    short_description = Column(Text)  # AI-generated 2-3 sentence summary
-
-    # ── Location ──
-    location = Column(JSON)  # legacy {city, country, remote} blob
-    country = Column(String(100))
-    city = Column(String(200))
-    state = Column(String(200))
-    is_remote = Column(Boolean)
-    work_arrangement = Column(String(30))  # remote / hybrid / onsite
-    latitude = Column(Float)
-    longitude = Column(Float)
-
-    # ── Employment Details ──
-    employment_type = Column(String(50))  # FULLTIME / PARTTIME / CONTRACT / INTERN
-    seniority_level = Column(String(30))  # junior / mid / senior / staff / principal
-    department = Column(String(200))  # engineering, marketing, etc.
-    category = Column(String(50), index=True)  # backend / frontend / fullstack / devops / data / ml / mobile / security / qa / general
-
-    # ── Compensation ──
-    salary_min = Column(String(50))
-    salary_max = Column(String(50))
-    salary_currency = Column(String(10))
-    salary_period = Column(String(20))  # year / month / week / hour
-
-    # ── Skills & Requirements ──
-    skills = Column(ARRAY(String), default=[])
-    required_experience_years = Column(Integer)
-    required_education = Column(String(100))  # e.g., "Bachelor's", "Master's"
-    key_responsibilities = Column(JSON)  # JSON array of strings
-    nice_to_have_skills = Column(JSON)  # JSON array of strings
-
-    # ── Benefits & Perks ──
-    benefits = Column(JSON)  # JSON array of strings
-    visa_sponsorship = Column(String(20))  # yes / no / unknown
-
-    # ── Dates ──
-    posted_at = Column(DateTime(timezone=True))
-    application_deadline = Column(DateTime(timezone=True))
-    fetched_at = Column(DateTime(timezone=True), server_default=func.now())
-
-    # ── Apply ──
-    apply_url = Column(String(1000))
-    apply_options = Column(JSON)  # JSON array of {url, publisher} for multiple apply links
-
-    # ── Quality / Meta ──
-    tags = Column(JSON)  # JSON array of source tags
-    quality_score = Column(Integer)  # 0-100
-    raw_data = Column(JSON)  # full original API response (backup)
-    title_company_hash = Column(String(64), index=True)
-
-    # ── Full-text search ──
-    search_vector = Column(TSVECTOR)  # auto-populated by DB trigger
-
-    __table_args__ = (
-        Index("idx_source_source_id", "source", "source_id", unique=True),
-        Index("idx_posted_at", "posted_at"),
-        Index("idx_category", "category"),
-        Index("idx_skills_gin", "skills", postgresql_using="gin"),
-        Index("idx_is_remote", "is_remote"),
-        Index("idx_seniority", "seniority_level"),
-        Index("idx_search_vector", "search_vector", postgresql_using="gin"),
+    await jobs.create_index(
+        [("title_company_hash", ASCENDING)],
+        unique=True,
+        sparse=True,
+        name="idx_title_company_hash",
     )
+    await jobs.create_index(
+        [("title", TEXT), ("company", TEXT), ("description", TEXT)],
+        weights={"title": 10, "company": 5, "description": 1},
+        name="idx_text_search",
+    )
+    await jobs.create_index([("posted_at", DESCENDING)], name="idx_posted_at")
+    await jobs.create_index([("category", ASCENDING)], name="idx_category")
+    await jobs.create_index([("is_remote", ASCENDING)], name="idx_is_remote")
+    await jobs.create_index([("seniority_level", ASCENDING)], name="idx_seniority")
+    await jobs.create_index([("application_deadline", ASCENDING)], name="idx_application_deadline")
+
+    companies = db["discovered_companies"]
+    await companies.create_index(
+        [("platform", ASCENDING), ("slug", ASCENDING)],
+        unique=True,
+        name="idx_platform_slug",
+    )
+    await companies.create_index([("is_active", ASCENDING)], name="idx_is_active")
+
+
+def normalize_doc(doc: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Remap MongoDB _id to id for API compatibility."""
+    if doc is None:
+        return None
+    doc["id"] = doc.pop("_id")
+    return doc

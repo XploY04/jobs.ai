@@ -4,10 +4,7 @@ import os
 
 from src.api.routes import router
 from src.database.operations import db
-from src.services.ingestion import IngestionScheduler
 from src.utils.config import settings
-
-scheduler = IngestionScheduler()
 
 
 def create_app() -> FastAPI:
@@ -27,14 +24,9 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     async def startup_event() -> None:
         await db.connect()
-        # Skip scheduler in test mode to avoid event loop issues
-        if not os.getenv('DISABLE_SCHEDULER'):
-            scheduler.start()
 
     @app.on_event("shutdown")
     async def shutdown_event() -> None:
-        if not os.getenv('DISABLE_SCHEDULER'):
-            scheduler.stop()
         await db.disconnect()
 
     app.include_router(router)

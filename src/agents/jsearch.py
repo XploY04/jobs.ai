@@ -58,6 +58,7 @@ class JSearchFetcher(BaseFetcher):
     ]
     
     MAX_PAGES = 5  # Pages per query
+    COUNTRIES = ["US", "GB", "IN"]
 
     def __init__(self) -> None:
         super().__init__("jsearch")
@@ -69,28 +70,30 @@ class JSearchFetcher(BaseFetcher):
         if not self.api_key:
             return []
 
-        logger.info("[%s] Fetching ALL IT/tech jobs (%d queries, %d pages each)", 
-                     self.source_name, len(self.QUERIES), self.MAX_PAGES)
+        logger.info("[%s] Fetching IT/tech jobs for %s (%d queries, %d pages each)",
+                     self.source_name, self.COUNTRIES, len(self.QUERIES), self.MAX_PAGES)
         results: List[Dict[str, Any]] = []
 
         async with aiohttp.ClientSession() as session:
-            for query in self.QUERIES:
-                query_jobs = await self._fetch_query(session, query)
-                results.extend(query_jobs)
-                await asyncio.sleep(1)  # stay within rate limits
+            for country in self.COUNTRIES:
+                for query in self.QUERIES:
+                    query_jobs = await self._fetch_query(session, query, country)
+                    results.extend(query_jobs)
+                    await asyncio.sleep(1)  # stay within rate limits
 
-        logger.info("[%s] Fetched %d total raw jobs (ALL - no filtering)", self.source_name, len(results))
+        logger.info("[%s] Fetched %d total raw jobs from %s", self.source_name, len(results), self.COUNTRIES)
         return results
 
-    async def _fetch_query(self, session: aiohttp.ClientSession, query: str) -> List[Dict[str, Any]]:
+    async def _fetch_query(self, session: aiohttp.ClientSession, query: str, country: str) -> List[Dict[str, Any]]:
         all_jobs: List[Dict[str, Any]] = []
-        
+
         for page in range(1, self.MAX_PAGES + 1):
             params = {
                 "query": query,
                 "page": str(page),
                 "num_pages": "1",
                 "date_posted": "month",
+                "country": country,
             }
             headers = {
                 "X-RapidAPI-Key": self.api_key,

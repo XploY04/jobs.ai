@@ -57,7 +57,7 @@ class Database:
 
         stats = {"new": 0, "skipped": 0}
 
-        if not self.db:
+        if self.db is None:
             raise RuntimeError("Database not connected")
 
         for job_data in jobs:
@@ -192,7 +192,7 @@ class Database:
     ) -> int:
         """Count total jobs matching the filters."""
 
-        if not self.db:
+        if self.db is None:
             raise RuntimeError("Database not connected")
 
         query = self._build_filter(
@@ -215,7 +215,7 @@ class Database:
     ) -> List[Dict[str, Any]]:
         """Return paginated jobs with filtering and full-text search."""
 
-        if not self.db:
+        if self.db is None:
             raise RuntimeError("Database not connected")
 
         limit = max(1, min(limit, 200))
@@ -246,7 +246,7 @@ class Database:
     async def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
         """Fetch a single job by identifier."""
 
-        if not self.db:
+        if self.db is None:
             raise RuntimeError("Database not connected")
 
         doc = await self.jobs.find_one({"_id": job_id}, {"raw_data": 0})
@@ -255,7 +255,7 @@ class Database:
     async def get_filter_options(self) -> Dict[str, Any]:
         """Get available filter options with job counts."""
 
-        if not self.db:
+        if self.db is None:
             raise RuntimeError("Database not connected")
 
         seniority_pipeline = [
@@ -299,7 +299,7 @@ class Database:
     async def cleanup_expired_jobs(self, default_expiry_days: int = 45) -> Dict[str, int]:
         """Remove jobs past their application_deadline or older than default_expiry_days."""
 
-        if not self.db:
+        if self.db is None:
             raise RuntimeError("Database not connected")
 
         now = datetime.now(timezone.utc)

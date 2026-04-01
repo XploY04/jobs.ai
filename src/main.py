@@ -19,6 +19,24 @@ async def _run_ingestion_once() -> dict:
     return summary
 
 
+async def _run_matching(user_id: str | None = None) -> dict:
+    from src.services.matcher import run_matching_for_all, run_matching_for_user
+    await db.connect()
+    if user_id:
+        result = await run_matching_for_user(user_id)
+    else:
+        result = await run_matching_for_all()
+    await db.disconnect()
+    return result
+
+
+async def _run_cleanup() -> dict:
+    await db.connect()
+    result = await db.cleanup_expired_jobs()
+    await db.disconnect()
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Backend & DevOps job aggregator")
     parser.add_argument(
@@ -26,8 +44,34 @@ def main() -> None:
         action="store_true",
         help="Run a single ingestion cycle then exit",
     )
+    parser.add_argument(
+        "--match",
+        action="store_true",
+        help="Run job matching for all enabled users then exit",
+    )
+    parser.add_argument(
+        "--match-user",
+        type=str,
+        default=None,
+        help="Run job matching for a specific user ID then exit",
+    )
+    parser.add_argument(
+        "--cleanup",
+        action="store_true",
+        help="Remove expired jobs then exit",
+    )
 
     args = parser.parse_args()
+
+    if args.match or args.match_user:
+        result = asyncio.run(_run_matching(args.match_user))
+        print(json.dumps(result, indent=2, default=str))  # noqa: T201
+        return
+
+    if args.cleanup:
+        result = asyncio.run(_run_cleanup())
+        print(json.dumps(result, indent=2))  # noqa: T201
+        return
 
     if args.ingest_once:
         summary = asyncio.run(_run_ingestion_once())

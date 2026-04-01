@@ -34,6 +34,23 @@ async def ensure_indexes(db) -> None:
     await jobs.create_index([("seniority_level", ASCENDING)], name="idx_seniority")
     await jobs.create_index([("application_deadline", ASCENDING)], name="idx_application_deadline")
 
+    # Job matches indexes
+    matches = db["job_matches"]
+    await matches.create_index(
+        [("user_id", ASCENDING), ("score", DESCENDING)],
+        name="idx_user_score",
+    )
+    await matches.create_index(
+        [("user_id", ASCENDING), ("job_id", ASCENDING)],
+        unique=True,
+        name="idx_user_job",
+    )
+    await matches.create_index(
+        [("computed_at", ASCENDING)],
+        expireAfterSeconds=14 * 24 * 3600,  # TTL: 14 days
+        name="idx_computed_at_ttl",
+    )
+
     companies = db["discovered_companies"]
     await companies.create_index(
         [("platform", ASCENDING), ("slug", ASCENDING)],

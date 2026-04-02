@@ -157,18 +157,19 @@ async def embed_jobs(job_ids: Optional[List[str]] = None) -> Dict[str, Any]:
 
             try:
                 embedding = _embed_text(text)
+                metadata = {
+                    "title": job.get("title") or "",
+                    "company": job.get("company") or "",
+                    "category": job.get("category") or "",
+                    "seniority_level": job.get("seniority_level") or "",
+                    "country": job.get("country") or "",
+                    "is_remote": bool(job.get("is_remote")),
+                    "source": job.get("source") or "",
+                }
                 vectors.append({
                     "id": job["_id"],
                     "values": embedding,
-                    "metadata": {
-                        "title": job.get("title", ""),
-                        "company": job.get("company", ""),
-                        "category": job.get("category", ""),
-                        "seniority_level": job.get("seniority_level", ""),
-                        "country": job.get("country", ""),
-                        "is_remote": job.get("is_remote", False),
-                        "source": job.get("source", ""),
-                    },
+                    "metadata": metadata,
                 })
             except Exception as e:
                 logger.error("Failed to embed job %s: %s", job["_id"], e)

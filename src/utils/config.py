@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     adzuna_api_key: Optional[str] = None
     gemini_api_key: Optional[str] = None
     openai_api_key: Optional[str] = None
+    pinecone_api_key: Optional[str] = None
     serpapi_key: Optional[str] = None
 
     # AI Enrichment

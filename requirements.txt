@@ -25,6 +25,9 @@ pyyaml==6.0.3
 google-generativeai==0.8.6
 openai==1.82.0
 
+# Vector Search
+pinecone==6.0.1
+
 # Testing
 pytest==9.0.2
 pytest-asyncio==1.3.0

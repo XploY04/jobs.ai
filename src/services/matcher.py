@@ -1,12 +1,10 @@
-"""Job-user matching orchestrator.
+"""Job-user matching orchestrator using Pinecone vector search.
 
-Two-stage pipeline:
-  Stage 1+2: Pre-filter with MongoDB, then score with structured signals (Python, no AI cost)
-  Stage 3: AI refinement via OpenAI on the top matches (costs API credits)
-
-Runs as:
-  - Weekly batch: all users with job_matching_enabled=true
-  - Single user: after resume parse or on-demand
+Pipeline:
+  1. Embed jobs at ingestion time → store in Pinecone (namespace: jobs-pool)
+  2. At match time: embed user profile → query Pinecone for top similar jobs
+  3. Apply structured scoring on Pinecone results (seniority, location, experience)
+  4. AI refinement via OpenAI on the top matches
 """
 
 from __future__ import annotations
@@ -15,17 +13,17 @@ import json
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
+from openai import OpenAI
+from pinecone import Pinecone
+
 from src.database.operations import db
 from src.services.match_scorer import (
-    WEIGHTS,
-    compute_idf,
     compute_total,
     experience_fit_score,
     is_stretch_match,
     location_match_score,
     salary_fit_score,
     seniority_fit_score,
-    skills_match_score,
     title_similarity_score,
 )
 from src.utils.config import settings
@@ -34,9 +32,159 @@ from src.utils.logger import setup_logger
 logger = setup_logger(__name__)
 
 MATCH_CREDIT_COST = 50
-TOP_N_STRUCTURED = 50  # Keep top 50 from Stage 1+2
-TOP_N_AI = 20  # Send top 20 to AI
+PINECONE_INDEX = "remotestar"
+PINECONE_NAMESPACE = "jobs-pool"
+EMBEDDING_MODEL = "text-embedding-3-large"
+TOP_N_VECTOR = 100       # Top results from Pinecone
+TOP_N_STRUCTURED = 50    # Keep after structured scoring
+TOP_N_AI = 20            # Send to AI refinement
 
+# Adjusted weights (skills matching now handled by vector similarity)
+MATCH_WEIGHTS = {
+    "vector_similarity": 0.40,
+    "title_similarity": 0.20,
+    "seniority_fit": 0.15,
+    "location_match": 0.15,
+    "experience_fit": 0.05,
+    "salary_fit": 0.05,
+}
+
+_openai_client: Optional[OpenAI] = None
+_pinecone_index = None
+
+
+def _get_openai() -> OpenAI:
+    global _openai_client
+    if _openai_client is None:
+        _openai_client = OpenAI(api_key=settings.openai_api_key)
+    return _openai_client
+
+
+def _get_pinecone_index():
+    global _pinecone_index
+    if _pinecone_index is None:
+        pc = Pinecone(api_key=settings.pinecone_api_key)
+        _pinecone_index = pc.Index(PINECONE_INDEX)
+    return _pinecone_index
+
+
+def _embed_text(text: str) -> List[float]:
+    """Generate embedding using OpenAI text-embedding-3-large."""
+    response = _get_openai().embeddings.create(model=EMBEDDING_MODEL, input=text)
+    return response.data[0].embedding
+
+
+def build_job_embed_text(job: dict) -> str:
+    """Build the text to embed for a job."""
+    parts = []
+    if job.get("title"):
+        parts.append(f"Title: {job['title']}")
+    if job.get("skills"):
+        parts.append(f"Skills: {', '.join(job['skills'][:20])}")
+    if job.get("seniority_level"):
+        parts.append(f"Seniority: {job['seniority_level']}")
+    if job.get("short_description"):
+        parts.append(f"Description: {job['short_description'][:500]}")
+    elif job.get("description"):
+        parts.append(f"Description: {job['description'][:500]}")
+    if job.get("category"):
+        parts.append(f"Category: {job['category']}")
+    return "\n".join(parts)
+
+
+def _build_user_embed_text(user: dict, resume_doc: Optional[dict] = None) -> str:
+    """Build the text to embed for a user profile."""
+    parts = []
+    if user.get("role_focus"):
+        parts.append(f"Role: {user['role_focus']}")
+    if user.get("skills"):
+        parts.append(f"Skills: {', '.join(user['skills'][:20])}")
+    if user.get("seniority_level"):
+        parts.append(f"Seniority: {user['seniority_level']}")
+    if user.get("years_of_experience") is not None:
+        parts.append(f"Experience: {user['years_of_experience']} years")
+
+    if resume_doc:
+        profile = resume_doc.get("editable_profile") or {}
+        # Add technologies from experiences
+        techs = set()
+        for exp in (profile.get("experiences") or []):
+            for tech in (exp.get("technologies") or []):
+                techs.add(tech)
+        if techs:
+            existing = set(user.get("skills") or [])
+            new_techs = techs - existing
+            if new_techs:
+                parts.append(f"Additional technologies: {', '.join(list(new_techs)[:10])}")
+        # Add summary
+        if profile.get("summary"):
+            parts.append(f"Summary: {profile['summary'][:300]}")
+
+    return "\n".join(parts)
+
+
+# ------------------------------------------------------------------
+# Job embedding (run at ingestion time)
+# ------------------------------------------------------------------
+
+async def embed_jobs(job_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Embed jobs and upsert to Pinecone. If job_ids is None, embed all unembedded jobs."""
+
+    if not settings.openai_api_key or not settings.pinecone_api_key:
+        logger.warning("OpenAI or Pinecone API key not set, skipping embedding")
+        return {"embedded": 0}
+
+    index = _get_pinecone_index()
+
+    query = {}
+    if job_ids:
+        query["_id"] = {"$in": job_ids}
+
+    jobs = await db.jobs.find(query, {"raw_data": 0}).to_list(length=None)
+    logger.info("Embedding %d jobs for Pinecone", len(jobs))
+
+    batch_size = 50
+    total_embedded = 0
+
+    for i in range(0, len(jobs), batch_size):
+        batch = jobs[i:i + batch_size]
+        vectors = []
+
+        for job in batch:
+            text = build_job_embed_text(job)
+            if not text.strip():
+                continue
+
+            try:
+                embedding = _embed_text(text)
+                vectors.append({
+                    "id": job["_id"],
+                    "values": embedding,
+                    "metadata": {
+                        "title": job.get("title", ""),
+                        "company": job.get("company", ""),
+                        "category": job.get("category", ""),
+                        "seniority_level": job.get("seniority_level", ""),
+                        "country": job.get("country", ""),
+                        "is_remote": job.get("is_remote", False),
+                        "source": job.get("source", ""),
+                    },
+                })
+            except Exception as e:
+                logger.error("Failed to embed job %s: %s", job["_id"], e)
+
+        if vectors:
+            index.upsert(vectors=vectors, namespace=PINECONE_NAMESPACE)
+            total_embedded += len(vectors)
+            logger.info("Upserted batch %d-%d (%d vectors)", i, i + len(batch), len(vectors))
+
+    logger.info("Embedding complete: %d jobs embedded", total_embedded)
+    return {"embedded": total_embedded}
+
+
+# ------------------------------------------------------------------
+# User matching
+# ------------------------------------------------------------------
 
 async def run_matching_for_all() -> Dict[str, Any]:
     """Weekly batch: match jobs for all users with job_matching_enabled=true."""
@@ -47,12 +195,6 @@ async def run_matching_for_all() -> Dict[str, Any]:
     if not users:
         return {"users_processed": 0, "total_matches": 0}
 
-    jobs = await _get_active_jobs()
-    if not jobs:
-        logger.warning("No jobs in database, skipping matching")
-        return {"users_processed": 0, "total_matches": 0}
-
-    idf = compute_idf(jobs)
     total_matches = 0
     users_processed = 0
     users_skipped = 0
@@ -69,7 +211,7 @@ async def run_matching_for_all() -> Dict[str, Any]:
             users_skipped += 1
             continue
 
-        matches = await _compute_matches(user, jobs, idf, run_ai=True)
+        matches = await _compute_matches(user, run_ai=True)
         await _save_matches(user["_id"], matches)
 
         total_matches += len(matches)
@@ -94,64 +236,75 @@ async def run_matching_for_user(user_id: str, run_ai: bool = True) -> Dict[str, 
         logger.error("User %s not found", user_id)
         return {"error": "user not found"}
 
-    jobs = await _get_active_jobs()
-    if not jobs:
-        return {"matches": 0}
-
-    idf = compute_idf(jobs)
-    matches = await _compute_matches(user, jobs, idf, run_ai=run_ai)
+    matches = await _compute_matches(user, run_ai=run_ai)
     await _save_matches(user_id, matches)
 
     logger.info("User %s: %d matches computed", user_id, len(matches))
     return {"matches": len(matches), "user_id": user_id}
 
 
-async def _compute_matches(
-    user: dict, jobs: List[dict], idf: Dict[str, float], run_ai: bool = False
-) -> List[dict]:
-    """Stage 1+2: pre-filter and score, then optionally Stage 3: AI refine."""
+async def _compute_matches(user: dict, run_ai: bool = False) -> List[dict]:
+    """Vector search + structured scoring + optional AI refinement."""
 
-    user_skills = [s.lower().strip() for s in (user.get("skills") or []) if s]
+    if not settings.openai_api_key or not settings.pinecone_api_key:
+        logger.warning("OpenAI or Pinecone not configured, cannot match")
+        return []
+
+    # Build user embedding
+    resume_doc = await db.db["resumes"].find_one({"user_id": user["_id"]})
+    user_text = _build_user_embed_text(user, resume_doc)
+    if not user_text.strip():
+        logger.warning("User %s has empty profile, cannot match", user["_id"])
+        return []
+
+    user_embedding = _embed_text(user_text)
     user_titles = _collect_user_titles(user)
     user_level = user.get("seniority_level")
     user_location = user.get("location")
     user_years = user.get("years_of_experience")
 
-    # Get resume for additional signals
-    resume_doc = await db.db["resumes"].find_one({"user_id": user["_id"]})
     user_education = None
     if resume_doc:
         profile = resume_doc.get("editable_profile") or {}
         education = profile.get("education") or []
         if education:
             user_education = education[0].get("degree")
-        # Add technologies from experiences to skills
-        for exp in (profile.get("experiences") or []):
-            for tech in (exp.get("technologies") or []):
-                skill = tech.lower().strip()
-                if skill and skill not in user_skills:
-                    user_skills.append(skill)
 
-    # Stage 1: Pre-filter with MongoDB
-    prefilter = {"posted_at": {"$gte": datetime.now(timezone.utc) - timedelta(days=30)}}
-    if user_skills:
-        prefilter["skills"] = {"$in": user_skills[:20]}
+    # Query Pinecone for top similar jobs
+    index = _get_pinecone_index()
+    results = index.query(
+        vector=user_embedding,
+        top_k=TOP_N_VECTOR,
+        namespace=PINECONE_NAMESPACE,
+        include_metadata=True,
+    )
 
-    candidate_jobs = await db.jobs.find(
-        prefilter,
+    if not results.matches:
+        logger.info("User %s: no Pinecone matches found", user["_id"])
+        return []
+
+    logger.info("User %s: %d vector matches from Pinecone", user["_id"], len(results.matches))
+
+    # Fetch full job docs from MongoDB for the matched IDs
+    job_ids = [m.id for m in results.matches]
+    job_docs = await db.jobs.find(
+        {"_id": {"$in": job_ids}},
         {"raw_data": 0, "description": 0},
-    ).to_list(length=1000)
+    ).to_list(length=None)
+    job_lookup = {j["_id"]: j for j in job_docs}
 
-    if not candidate_jobs:
-        candidate_jobs = jobs[:500]
+    # Build score map from Pinecone similarity
+    similarity_map = {m.id: m.score for m in results.matches}
 
-    logger.info("User %s: %d candidate jobs after pre-filter", user["_id"], len(candidate_jobs))
-
-    # Stage 2: Score each candidate
+    # Stage 2: Structured scoring on Pinecone results
     scored = []
-    for job in candidate_jobs:
+    for job_id, vector_score in similarity_map.items():
+        job = job_lookup.get(job_id)
+        if not job:
+            continue
+
         signals = {
-            "skills_match": skills_match_score(user_skills, job.get("skills") or [], idf),
+            "vector_similarity": vector_score,
             "title_similarity": title_similarity_score(user_titles, job.get("title", "")),
             "seniority_fit": seniority_fit_score(user_level, job.get("seniority_level")),
             "location_match": location_match_score(user_location, job.get("country"), job.get("is_remote")),
@@ -159,7 +312,7 @@ async def _compute_matches(
             "salary_fit": salary_fit_score(None, job.get("salary_min"), job.get("salary_max")),
         }
 
-        score = compute_total(signals)
+        score = _compute_weighted_score(signals)
         if score < 25:
             continue
 
@@ -185,7 +338,7 @@ async def _compute_matches(
 
     # Stage 3: AI refinement on top 20
     if run_ai and top_matches:
-        ai_results = await _ai_refine(user, candidate_jobs, top_matches[:TOP_N_AI])
+        ai_results = await _ai_refine(user, job_lookup, top_matches[:TOP_N_AI])
         for match in top_matches:
             ai = ai_results.get(match["job_id"])
             if ai:
@@ -194,14 +347,18 @@ async def _compute_matches(
                 match["skills_gap"] = ai.get("skills_gap", [])
                 match["strengths"] = ai.get("strengths", [])
 
-        # Re-sort by AI score where available, fall back to structured score
         top_matches.sort(key=lambda x: x.get("ai_score") or x["score"], reverse=True)
 
     return top_matches
 
 
+def _compute_weighted_score(signals: Dict[str, float]) -> int:
+    """Combine signals into 0-100 score using match weights."""
+    total = sum(signals.get(k, 0.0) * v for k, v in MATCH_WEIGHTS.items())
+    return max(0, min(100, round(total * 100)))
+
+
 def _collect_user_titles(user: dict) -> List[str]:
-    """Collect role_focus + any other title signals."""
     titles = []
     if user.get("role_focus"):
         titles.append(user["role_focus"])
@@ -209,14 +366,9 @@ def _collect_user_titles(user: dict) -> List[str]:
 
 
 async def _ai_refine(
-    user: dict, all_jobs: List[dict], top_matches: List[dict]
+    user: dict, job_lookup: Dict[str, dict], top_matches: List[dict]
 ) -> Dict[str, dict]:
     """Stage 3: Send top matches to OpenAI for scoring + reasoning."""
-
-    if not settings.openai_api_key and not settings.gemini_api_key:
-        return {}
-
-    job_lookup = {j["_id"]: j for j in all_jobs}
 
     user_summary = (
         f"Role: {user.get('role_focus', 'Unknown')}. "
@@ -258,20 +410,7 @@ async def _ai_refine(
     )
 
     try:
-        result = _call_ai(prompt)
-        if isinstance(result, list):
-            return {item["job_id"]: item for item in result if "job_id" in item}
-    except Exception as e:
-        logger.error("AI refinement failed: %s", e)
-
-    return {}
-
-
-def _call_ai(prompt: str) -> Any:
-    """Call whichever AI provider is configured."""
-    if settings.openai_api_key:
-        from openai import OpenAI
-        client = OpenAI(api_key=settings.openai_api_key)
+        client = _get_openai()
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             temperature=0,
@@ -283,45 +422,29 @@ def _call_ai(prompt: str) -> Any:
         )
         parsed = json.loads(response.choices[0].message.content)
         if isinstance(parsed, dict) and "matches" in parsed:
-            return parsed["matches"]
+            return {item["job_id"]: item for item in parsed["matches"] if "job_id" in item}
         if isinstance(parsed, list):
-            return parsed
-        return []
-    elif settings.gemini_api_key:
-        import google.generativeai as genai
-        from google.generativeai.types import GenerationConfig
-        genai.configure(api_key=settings.gemini_api_key)
-        model = genai.GenerativeModel(
-            model_name="gemini-2.5-flash-lite",
-            generation_config=GenerationConfig(response_mime_type="application/json", temperature=0),
-        )
-        response = model.generate_content(prompt)
-        return json.loads(response.text)
-    return []
+            return {item["job_id"]: item for item in parsed if "job_id" in item}
+    except Exception as e:
+        logger.error("AI refinement failed: %s", e)
 
+    return {}
+
+
+# ------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------
 
 async def _get_matching_users() -> List[dict]:
-    """Fetch all users with job_matching_enabled=true."""
     cursor = db.db["users"].find(
-        {"job_matching_enabled": True, "skills": {"$exists": True, "$ne": []}},
+        {"job_matching_enabled": True},
         {"skills": 1, "role_focus": 1, "seniority_level": 1, "location": 1,
          "years_of_experience": 1, "email": 1, "credits": 1},
     )
     return await cursor.to_list(length=None)
 
 
-async def _get_active_jobs() -> List[dict]:
-    """Fetch all jobs from the last 30 days."""
-    cutoff = datetime.now(timezone.utc) - timedelta(days=30)
-    cursor = db.jobs.find(
-        {"posted_at": {"$gte": cutoff}},
-        {"raw_data": 0, "description": 0},
-    )
-    return await cursor.to_list(length=None)
-
-
 async def _deduct_credits(user_id: str, email: str) -> bool:
-    """Deduct matching credits from user. Returns False if insufficient."""
     user = await db.db["users"].find_one({"_id": user_id})
     if not user or user.get("credits", 0) < MATCH_CREDIT_COST:
         return False
@@ -346,7 +469,6 @@ async def _deduct_credits(user_id: str, email: str) -> bool:
 
 
 async def _save_matches(user_id: str, matches: List[dict]) -> None:
-    """Delete old matches and insert new ones for a user."""
     await db.db["job_matches"].delete_many({"user_id": user_id})
     if matches:
         await db.db["job_matches"].insert_many(matches)

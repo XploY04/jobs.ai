@@ -30,6 +30,14 @@ async def _run_matching(user_id: str | None = None) -> dict:
     return result
 
 
+async def _run_embed_jobs() -> dict:
+    from src.services.matcher import embed_jobs
+    await db.connect()
+    result = await embed_jobs()
+    await db.disconnect()
+    return result
+
+
 async def _run_cleanup() -> dict:
     await db.connect()
     result = await db.cleanup_expired_jobs()
@@ -56,12 +64,22 @@ def main() -> None:
         help="Run job matching for a specific user ID then exit",
     )
     parser.add_argument(
+        "--embed-jobs",
+        action="store_true",
+        help="Embed all jobs into Pinecone then exit",
+    )
+    parser.add_argument(
         "--cleanup",
         action="store_true",
         help="Remove expired jobs then exit",
     )
 
     args = parser.parse_args()
+
+    if args.embed_jobs:
+        result = asyncio.run(_run_embed_jobs())
+        print(json.dumps(result, indent=2, default=str))  # noqa: T201
+        return
 
     if args.match or args.match_user:
         result = asyncio.run(_run_matching(args.match_user))

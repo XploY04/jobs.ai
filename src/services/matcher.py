@@ -203,7 +203,8 @@ async def run_matching_for_all() -> Dict[str, Any]:
     for user in users:
         credits = user.get("credits", 0)
         if credits < MATCH_CREDIT_COST:
-            logger.info("Skipping user %s: insufficient credits (%d)", user["_id"], credits)
+            logger.info("Skipping user %s: insufficient credits (%d), pausing matching", user["_id"], credits)
+            await _pause_matching(user)
             users_skipped += 1
             continue
 
@@ -440,9 +441,35 @@ async def _get_matching_users() -> List[dict]:
     cursor = db.db["users"].find(
         {"job_matching_enabled": True},
         {"skills": 1, "role_focus": 1, "seniority_level": 1, "location": 1,
-         "years_of_experience": 1, "email": 1, "credits": 1},
+         "years_of_experience": 1, "email": 1, "credits": 1, "first_name": 1},
     )
     return await cursor.to_list(length=None)
+
+
+async def _pause_matching(user: dict) -> None:
+    """Auto-disable matching and send notification email."""
+    user_id = user["_id"]
+    email = user.get("email", "")
+    first_name = user.get("first_name", "there")
+    credits = user.get("credits", 0)
+
+    # Disable toggle and set paused reason
+    await db.db["users"].update_one(
+        {"_id": user_id},
+        {"$set": {
+            "job_matching_enabled": False,
+            "job_matching_paused_reason": "insufficient_credits",
+        }},
+    )
+
+    # Get previous match count for the email
+    match_count = await db.db["job_matches"].count_documents({"user_id": user_id})
+
+    # Send email
+    from src.services.email_service import send_matching_paused_email
+    send_matching_paused_email(email, first_name, credits, match_count)
+
+    logger.info("Paused matching for user %s, email sent to %s", user_id, email)
 
 
 async def _deduct_credits(user_id: str, email: str) -> bool:

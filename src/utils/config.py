@@ -17,6 +17,11 @@ class Settings(BaseSettings):
     pinecone_api_key: Optional[str] = None
     serpapi_key: Optional[str] = None
 
+    # Email (Gmail SMTP)
+    email_user: Optional[str] = None
+    email_password: Optional[str] = None
+    candidate_app_url: str = "https://candidate.remotestar.io"
+
     # AI Enrichment
     enable_ai_enrichment: bool = True
 

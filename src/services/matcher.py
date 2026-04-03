@@ -239,23 +239,37 @@ async def run_matching_for_all() -> Dict[str, Any]:
     return summary
 
 
-async def run_matching_for_user(user_id: str, run_ai: bool = True) -> Dict[str, Any]:
-    """Single user matching (on-demand or after resume parse)."""
+async def run_matching_for_user(user_id: str, run_ai: bool = True, redis_client=None) -> Dict[str, Any]:
+    """Single user matching. If redis_client is provided, publishes progress events."""
+
+    def publish(stage: str, message: str, progress: int = 0, **extra):
+        if redis_client:
+            event = json.dumps({"stage": stage, "message": message, "progress": progress, **extra})
+            redis_client.publish(f"match:progress:{user_id}", event)
 
     user = await db.db["users"].find_one({"_id": user_id})
     if not user:
         logger.error("User %s not found", user_id)
+        publish("error", "User not found")
         return {"error": "user not found"}
 
-    matches = await _compute_matches(user, run_ai=run_ai)
+    publish("embedding", "Analyzing your profile...", 0)
+    matches = await _compute_matches(user, run_ai=run_ai, progress_fn=publish)
+
+    publish("saving", f"Saving {len(matches)} matches...", 95)
     await _save_matches(user_id, matches)
 
+    publish("done", f"Found {len(matches)} matches!", 100, matches=len(matches))
     logger.info("User %s: %d matches computed", user_id, len(matches))
     return {"matches": len(matches), "user_id": user_id}
 
 
-async def _compute_matches(user: dict, run_ai: bool = False) -> List[dict]:
+async def _compute_matches(user: dict, run_ai: bool = False, progress_fn=None) -> List[dict]:
     """Vector search + structured scoring + optional AI refinement."""
+
+    def _progress(stage, message, progress=0, **extra):
+        if progress_fn:
+            progress_fn(stage, message, progress, **extra)
 
     if not settings.openai_api_key or not settings.pinecone_api_key:
         logger.warning("OpenAI or Pinecone not configured, cannot match")
@@ -268,6 +282,7 @@ async def _compute_matches(user: dict, run_ai: bool = False) -> List[dict]:
         logger.warning("User %s has empty profile, cannot match", user["_id"])
         return []
 
+    _progress("embedding", "Embedding your profile...", 5)
     user_embedding = _embed_text(user_text)
     user_titles = _collect_user_titles(user)
     user_level = user.get("seniority_level")
@@ -282,6 +297,7 @@ async def _compute_matches(user: dict, run_ai: bool = False) -> List[dict]:
             user_education = education[0].get("degree")
 
     # Query Pinecone for top similar jobs
+    _progress("searching", "Searching jobs in Pinecone...", 15)
     index = _get_pinecone_index()
     results = index.query(
         vector=user_embedding,
@@ -306,6 +322,8 @@ async def _compute_matches(user: dict, run_ai: bool = False) -> List[dict]:
 
     # Build score map from Pinecone similarity
     similarity_map = {m.id: m.score for m in results.matches}
+
+    _progress("scoring", f"Scoring {len(job_docs)} candidate jobs...", 35)
 
     # Stage 2: Structured scoring on Pinecone results
     scored = []
@@ -348,6 +366,7 @@ async def _compute_matches(user: dict, run_ai: bool = False) -> List[dict]:
     top_matches = scored[:TOP_N_STRUCTURED]
 
     # Stage 3: AI refinement on top 20
+    _progress("ai_refining", f"AI analyzing top {min(len(top_matches), TOP_N_AI)} matches...", 60)
     if run_ai and top_matches:
         ai_results = await _ai_refine(user, job_lookup, top_matches[:TOP_N_AI])
         for match in top_matches:

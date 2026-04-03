@@ -1,0 +1,78 @@
+"""Redis Pub/Sub worker for on-demand job matching.
+
+Subscribes to match:start:* channels. When a message arrives,
+runs the matching pipeline for that user and publishes progress
+events to match:progress:{user_id}.
+
+Run with: python -m src.main --worker
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+
+import redis
+
+from src.database.operations import db
+from src.services.matcher import run_matching_for_user
+from src.utils.config import settings
+from src.utils.logger import setup_logger
+
+logger = setup_logger(__name__)
+
+
+async def start_worker() -> None:
+    """Main worker loop: subscribe to Redis and process match requests."""
+
+    if not settings.redis_url:
+        logger.error("REDIS_URL not configured, cannot start worker")
+        return
+
+    await db.connect()
+    logger.info("Worker connected to MongoDB")
+
+    redis_client = redis.Redis.from_url(settings.redis_url, decode_responses=True)
+    redis_client.ping()
+    logger.info("Worker connected to Redis")
+
+    pubsub = redis_client.pubsub()
+    pubsub.psubscribe("match:start:*")
+    logger.info("Worker listening for match requests on match:start:*")
+
+    try:
+        while True:
+            message = pubsub.get_message(timeout=1.0)
+            if message and message["type"] == "pmessage":
+                try:
+                    data = json.loads(message["data"])
+                    user_id = data.get("user_id")
+                    if not user_id:
+                        logger.warning("Received match:start without user_id: %s", data)
+                        continue
+
+                    logger.info("Match request received for user %s", user_id)
+                    await run_matching_for_user(user_id, run_ai=True, redis_client=redis_client)
+
+                except json.JSONDecodeError:
+                    logger.error("Invalid JSON in match:start message: %s", message["data"])
+                except Exception as e:
+                    # Publish error event if we have a user_id
+                    user_id = None
+                    try:
+                        user_id = json.loads(message["data"]).get("user_id")
+                    except Exception:
+                        pass
+                    if user_id:
+                        error_event = json.dumps({"stage": "error", "message": str(e)})
+                        redis_client.publish(f"match:progress:{user_id}", error_event)
+                    logger.error("Error processing match request: %s", e, exc_info=True)
+
+            await asyncio.sleep(0.01)
+
+    except KeyboardInterrupt:
+        logger.info("Worker shutting down")
+    finally:
+        pubsub.unsubscribe()
+        redis_client.close()
+        await db.disconnect()

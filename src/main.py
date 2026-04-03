@@ -69,12 +69,22 @@ def main() -> None:
         help="Embed all jobs into Pinecone then exit",
     )
     parser.add_argument(
+        "--worker",
+        action="store_true",
+        help="Start Redis pub/sub worker for on-demand matching",
+    )
+    parser.add_argument(
         "--cleanup",
         action="store_true",
         help="Remove expired jobs then exit",
     )
 
     args = parser.parse_args()
+
+    if args.worker:
+        from src.services.match_worker import start_worker
+        asyncio.run(start_worker())
+        return
 
     if args.embed_jobs:
         result = asyncio.run(_run_embed_jobs())

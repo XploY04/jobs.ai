@@ -10,9 +10,9 @@ sources:
   jsearch:
     days: [0, 2, 4]                # Mon, Wed, Fri (costs RapidAPI credits)
   adzuna:
-    days: [1, 3, 5]                # Tue, Thu, Sat (has daily quotas)
+    days: [0, 1, 2, 3, 4, 5, 6]   # daily (3 countries is light, quotas reset daily)
   hackernews:
     days: [1, 15]                  # 1st and 15th of month (thread posts monthly)
     type: monthly
   ats_scraper:
-    days: [6]                      # Sunday only (company lists don't change often)
+    days: [0, 2, 4, 6]            # Mon, Wed, Fri, Sun (high quality direct company jobs)

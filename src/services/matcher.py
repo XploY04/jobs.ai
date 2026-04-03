@@ -128,7 +128,7 @@ def _build_user_embed_text(user: dict, resume_doc: Optional[dict] = None) -> str
 # ------------------------------------------------------------------
 
 async def embed_jobs(job_ids: Optional[List[str]] = None) -> Dict[str, Any]:
-    """Embed jobs and upsert to Pinecone. If job_ids is None, embed all unembedded jobs."""
+    """Embed jobs and upsert to Pinecone. Only embeds jobs not already embedded."""
 
     if not settings.openai_api_key or not settings.pinecone_api_key:
         logger.warning("OpenAI or Pinecone API key not set, skipping embedding")
@@ -136,12 +136,16 @@ async def embed_jobs(job_ids: Optional[List[str]] = None) -> Dict[str, Any]:
 
     index = _get_pinecone_index()
 
-    query = {}
     if job_ids:
-        query["_id"] = {"$in": job_ids}
+        query = {"_id": {"$in": job_ids}}
+    else:
+        query = {"pinecone_embedded_at": {"$exists": False}}
 
     jobs = await db.jobs.find(query, {"raw_data": 0}).to_list(length=None)
-    logger.info("Embedding %d jobs for Pinecone", len(jobs))
+    logger.info("Embedding %d new jobs for Pinecone", len(jobs))
+
+    if not jobs:
+        return {"embedded": 0}
 
     batch_size = 50
     total_embedded = 0
@@ -176,10 +180,15 @@ async def embed_jobs(job_ids: Optional[List[str]] = None) -> Dict[str, Any]:
 
         if vectors:
             index.upsert(vectors=vectors, namespace=PINECONE_NAMESPACE)
+            embedded_ids = [v["id"] for v in vectors]
+            await db.jobs.update_many(
+                {"_id": {"$in": embedded_ids}},
+                {"$set": {"pinecone_embedded_at": datetime.now(timezone.utc)}},
+            )
             total_embedded += len(vectors)
             logger.info("Upserted batch %d-%d (%d vectors)", i, i + len(batch), len(vectors))
 
-    logger.info("Embedding complete: %d jobs embedded", total_embedded)
+    logger.info("Embedding complete: %d new jobs embedded", total_embedded)
     return {"embedded": total_embedded}
 
 

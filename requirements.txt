@@ -12,8 +12,6 @@ uvicorn==0.42.0
 
 # HTTP
 aiohttp==3.13.4
-httpx==0.28.1
-
 # RSS Parsing
 feedparser==6.0.12
 

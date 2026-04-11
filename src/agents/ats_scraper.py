@@ -372,7 +372,7 @@ class ATSScraperFetcher(BaseFetcher):
                 "salary_min": None,
                 "salary_max": None,
                 "salary_currency": None,
-                "apply_url": item.get("ref", f"https://jobs.smartrecruiters.com/{slug}/{item.get('id', '')}"),
+                "apply_url": f"https://jobs.smartrecruiters.com/{slug}/{item.get('id', '')}",
                 "posted_at": self._parse_iso_date(item.get("releasedDate")),
                 "raw_data": {"ats": "smartrecruiters", "slug": slug, "job_id": item.get("id")},
             })

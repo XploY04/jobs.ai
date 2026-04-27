@@ -32,8 +32,8 @@ from src.utils.logger import setup_logger
 logger = setup_logger(__name__)
 
 MATCH_CREDIT_COST = 50
-PINECONE_INDEX = "remotestar"
-PINECONE_NAMESPACE = "jobs-pool"
+PINECONE_INDEX = settings.pinecone_index or "remotestar"
+PINECONE_NAMESPACE = settings.pinecone_namespace or "jobs-pool"
 EMBEDDING_MODEL = "text-embedding-3-large"
 TOP_N_VECTOR = 100       # Top results from Pinecone
 TOP_N_STRUCTURED = 50    # Keep after structured scoring

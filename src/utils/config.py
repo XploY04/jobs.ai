@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     gemini_api_key: Optional[str] = None
     openai_api_key: Optional[str] = None
     pinecone_api_key: Optional[str] = None
+    pinecone_index: Optional[str] = None
+    pinecone_namespace: Optional[str] = None
     redis_url: Optional[str] = None
     serpapi_key: Optional[str] = None
 

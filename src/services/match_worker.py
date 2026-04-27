@@ -44,6 +44,7 @@ async def start_worker() -> None:
         while True:
             message = pubsub.get_message(timeout=1.0)
             if message and message["type"] == "pmessage":
+                user_id = None
                 try:
                     data = json.loads(message["data"])
                     user_id = data.get("user_id")
@@ -57,16 +58,18 @@ async def start_worker() -> None:
                 except json.JSONDecodeError:
                     logger.error("Invalid JSON in match:start message: %s", message["data"])
                 except Exception as e:
-                    # Publish error event if we have a user_id
-                    user_id = None
-                    try:
-                        user_id = json.loads(message["data"]).get("user_id")
-                    except Exception:
-                        pass
                     if user_id:
                         error_event = json.dumps({"stage": "error", "message": str(e)})
                         redis_client.publish(f"match:progress:{user_id}", error_event)
                     logger.error("Error processing match request: %s", e, exc_info=True)
+                finally:
+                    # Always clear the matching lock so the user can retry
+                    if user_id:
+                        try:
+                            redis_client.delete(f"matching:lock:{user_id}")
+                            logger.info("Cleared matching lock for user %s", user_id)
+                        except Exception as lock_err:
+                            logger.error("Failed to clear lock for %s: %s", user_id, lock_err)
 
             await asyncio.sleep(0.01)
 

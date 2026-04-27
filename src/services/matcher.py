@@ -39,9 +39,9 @@ TOP_N_VECTOR = 100       # Top results from Pinecone
 TOP_N_STRUCTURED = 50    # Keep after structured scoring
 TOP_N_AI = 20            # Send to AI refinement
 
-# Adjusted weights (skills matching now handled by vector similarity)
+# Skills match is computed via vector similarity (semantic match between user profile and job)
 MATCH_WEIGHTS = {
-    "vector_similarity": 0.40,
+    "skills_match": 0.40,
     "title_similarity": 0.20,
     "seniority_fit": 0.15,
     "location_match": 0.15,
@@ -333,7 +333,7 @@ async def _compute_matches(user: dict, run_ai: bool = False, progress_fn=None) -
             continue
 
         signals = {
-            "vector_similarity": vector_score,
+            "skills_match": vector_score,
             "title_similarity": title_similarity_score(user_titles, job.get("title", "")),
             "seniority_fit": seniority_fit_score(user_level, job.get("seniority_level")),
             "location_match": location_match_score(user_location, job.get("country"), job.get("is_remote")),
